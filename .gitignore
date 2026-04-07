@@ -1,0 +1,11 @@
+.env
+.cache/
+__pycache__/
+*.pyc
+preferences.md
+data/
+screenshots/
+venv/
+.DS_Store
+.claude/
+logs/

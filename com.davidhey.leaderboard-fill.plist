@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.davidhey.leaderboard-fill</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/davidhey/code/cycling-coach/venv/bin/python3</string>
+    <string>/Users/davidhey/code/cycling-coach/fill_leaderboards.py</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>1800</integer>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/davidhey/code/cycling-coach</string>
+
+  <key>StandardOutPath</key>
+  <string>/Users/davidhey/Library/Logs/cycling-coach/leaderboard-fill.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/davidhey/Library/Logs/cycling-coach/leaderboard-fill.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
