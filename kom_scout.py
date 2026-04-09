@@ -87,6 +87,21 @@ def _power_pct_color(pct):
     return "#ef4444"
 
 
+def _phenotype_match(kom_time_s, phenotype):
+    """
+    Return 'ideal' | 'ok' | 'mismatch' | None based on segment KOM duration vs athlete phenotype.
+    'ideal' = within the phenotype's best range; 'ok' = within 60-150% of range endpoints.
+    """
+    if not kom_time_s or not phenotype or phenotype.get("primary") in ("unknown", "all-rounder"):
+        return None
+    lo, hi = phenotype.get("best_kom_duration_range_s", [0, 9999])
+    if lo <= kom_time_s <= hi:
+        return "ideal"
+    if lo * 0.6 <= kom_time_s <= hi * 1.5:
+        return "ok"
+    return "mismatch"
+
+
 def _compute_athlete_percentiles():
     """Load all cached seg_stats and compute p25/p75/p90 of total_athletes."""
     counts = []
@@ -138,7 +153,7 @@ def _build_full_tracker(starred, ride_segs, fetch_leaderboard_fn, curve_data,
         latlng = seg.get("start_latlng")
         if not latlng or len(latlng) < 2:
             return True
-        return metrics._haversine_km(home_lat, home_lng, latlng[0], latlng[1]) <= 80
+        return metrics.haversine_km(home_lat, home_lng, latlng[0], latlng[1]) <= 80
 
     starred_ids = {s["id"] for s in (starred or []) if _is_local(s)}
 
@@ -606,6 +621,9 @@ def _segment_row(seg, p25, p75, p90):
 
     famous_badge = (' <span class="badge badge-gold">★ Famous</span>'
                     if seg.get("is_famous") else "")
+    match = seg.get("phenotype_match")
+    match_badge = (' <span class="badge" style="background:#14532d33;color:#4ade80;font-size:10px">✓ match</span>'
+                   if match == "ideal" else "")
 
     comp_label, comp_color = _competition_badge(seg.get("total_athletes", 0), p25, p75, p90)
     comp_html = (f'<span class="badge" style="background:{comp_color}22;color:{comp_color}">'
@@ -633,7 +651,7 @@ def _segment_row(seg, p25, p75, p90):
 
     return f"""
       <tr{data_attrs}>
-        <td><a href="{url}" target="_blank" class="seg-link">{seg["segment_name"]}</a>{famous_badge}</td>
+        <td><a href="{url}" target="_blank" class="seg-link">{seg["segment_name"]}</a>{famous_badge}{match_badge}</td>
         <td>{grade_str}</td>
         <td>{seg.get("effort_count") or "—"}</td>
         <td>{_fmt_time(seg.get("elapsed_time_s"))}</td>
@@ -766,7 +784,7 @@ def _render_exec_summary(summary):
 
 
 def _render_html(tier1, tier2, landmarks, tier3, curve_data, ftp_outdoor, ftp_indoor, p25, p75, p90,
-                 home_lat=None, home_lng=None):
+                 home_lat=None, home_lng=None, phenotype=None):
     today = date.today().isoformat()
 
     # Header power stats
@@ -778,6 +796,11 @@ def _render_html(tier1, tier2, landmarks, tier3, curve_data, ftp_outdoor, ftp_in
         best = (curve_data.get(dur) or {}).get("best")
         if best:
             pills.append(f'<div class="stat-pill">{label}: <strong>{best}w</strong></div>')
+    if phenotype and phenotype.get("primary") not in ("unknown", None):
+        pills.append(
+            f'<div class="stat-pill">Phenotype: <strong>{phenotype["primary"]}</strong>'
+            f' — {phenotype["best_kom_label"]}</div>'
+        )
     header_stats = f'<div class="header-stats">{"".join(pills)}</div>'
 
     # Executive summary
@@ -1106,7 +1129,7 @@ def _apply_filters(segments, keyword=None, min_grade=None, max_grade=None,
         if max_radius is not None and home_lat and home_lng:
             latlng = seg.get("start_latlng")
             if latlng and len(latlng) >= 2:
-                dist = metrics._haversine_km(home_lat, home_lng, latlng[0], latlng[1])
+                dist = metrics.haversine_km(home_lat, home_lng, latlng[0], latlng[1])
                 if dist > max_radius:
                     continue
         result.append(seg)
@@ -1151,6 +1174,8 @@ def main():
         activities, strava_client.fetch_power_stream,
         ftp_outdoor=ftp_outdoor, ftp_indoor=ftp_indoor
     )
+    phenotype = metrics.compute_power_phenotype(curve_data)
+    print(f"Phenotype: {phenotype['primary']} — {phenotype['best_kom_label']}")
 
     print("Fetching starred segments...")
     starred = strava_client.fetch_starred_segments()
@@ -1208,6 +1233,10 @@ def main():
     else:
         print(f"Tier 3: {len(tier3)} candidates loaded")
 
+    # 4b. Annotate segments with phenotype match
+    for seg in tier1 + tier2:
+        seg["phenotype_match"] = _phenotype_match(seg.get("kom_time_s"), phenotype)
+
     # 5. Competition percentiles (data-driven from cache)
     p25, p75, p90 = _compute_athlete_percentiles()
     print(f"Competition thresholds — Local:<{p25:.0f} | Competitive:{p25:.0f}–{p75:.0f} | "
@@ -1219,7 +1248,7 @@ def main():
     print(f"Saved: data/reports/kom_scout_{today}.json")
 
     html = _render_html(tier1, tier2, landmarks, tier3, curve_data, ftp_outdoor, ftp_indoor, p25, p75, p90,
-                        home_lat=home_lat, home_lng=home_lng)
+                        home_lat=home_lat, home_lng=home_lng, phenotype=phenotype)
     _save_and_open(html)
 
 

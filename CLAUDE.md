@@ -35,6 +35,7 @@ python block_debrief.py             # End-of-block Q&A (run before --new-block)
 python kom_scout.py                 # KOM opportunity report
 python segment_scout.py             # Discover new segments via Strava Explore API
 python segment_similarity.py        # Find segments similar to David's proven top-10 KOM efforts
+python segment_similarity.py --calibrate  # Physics model calibration against David's PRs (streams cached)
 python calibrate_targets.py         # Recalibrate watt targets (also auto-called by main.py)
 python calibrate_peloton.py         # First-run FTP estimation via CP model
 python power_audit.py               # Per-ride interval diagnostics
@@ -63,7 +64,7 @@ python replan.py --dry-run          # Preview replan without saving
 | `fill_leaderboards.py` | Batch leaderboard cache warming (runs every 30min) |
 | `replan.py` | Mid-week adaptive replan: reads completed-session power actuals + Strava descriptions → Claude adjusts remaining days with dampening rules |
 | `kom_scout.py` | Segment ranking + KOM opportunity HTML report; badges segments by phenotype match |
-| `segment_similarity.py` | Nearest-neighbor similarity search: surfaces segments matching David's proven top-10 profile using standardized euclidean distance on [grade, log(duration), log(athletes)] |
+| `segment_similarity.py` | Nearest-neighbor similarity search: surfaces segments matching David's proven top-10 profile using standardized euclidean distance on [grade, log(duration), log(athletes)]. Physics model (profile-based + avg-grade fallback) estimates KOM/10th-place power with ranges. Constants: WEIGHT_KG=87 (77 rider + 10 bike), CRR=0.005, +7% grade correction at ≥12%. `--calibrate` runs model validation against all local PRs. |
 | `preferences.md` | **Source of truth for athlete config** — FTP, zones, HR, goals, home lat/lng |
 
 ---

@@ -130,6 +130,7 @@ def main():
             "total_athletes":          total,
             "achievability":           achievability,
             "tier":                    3,
+            "start_latlng":            seg.get("start_latlng"),
         })
 
     candidates.sort(key=lambda s: (s["achievability"], s.get("total_athletes", 0)), reverse=True)
