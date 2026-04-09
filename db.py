@@ -147,6 +147,32 @@ _TABLES = [
         disruptions     TEXT,
         created_at      TIMESTAMP DEFAULT current_timestamp
     )""",
+    """CREATE TABLE IF NOT EXISTS power_curve_extended (
+        week_end DATE PRIMARY KEY,
+        s60      INT,
+        s120     INT,
+        s180     INT,
+        s300     INT,
+        s480     INT,
+        s600     INT,
+        s720     INT,
+        s900     INT,
+        s1200    INT
+    )""",
+    """CREATE TABLE IF NOT EXISTS cp_model_weekly (
+        week_end             DATE PRIMARY KEY,
+        cp_watts             INT,
+        w_prime_kj           FLOAT,
+        k_constant           FLOAT,
+        model_type           VARCHAR,
+        r_squared            FLOAT,
+        anchor_count         INT,
+        max_duration_used_s  INT,
+        anchors_only_short   BOOLEAN,
+        est_20min            INT,
+        est_60min            INT,
+        confidence           VARCHAR
+    )""",
 ]
 
 
@@ -169,6 +195,19 @@ def get_conn():
         conn.execute("ALTER TABLE segment_efforts DROP COLUMN achievability")
     except Exception:
         pass
+    # Migrate power_curve_extended: add likelihood columns
+    for col in ["s60_likelihood", "s120_likelihood", "s180_likelihood", "s300_likelihood",
+                "s480_likelihood", "s600_likelihood", "s720_likelihood", "s900_likelihood",
+                "s1200_likelihood"]:
+        try:
+            conn.execute(f"ALTER TABLE power_curve_extended ADD COLUMN {col} FLOAT")
+        except Exception:
+            pass
+    # Migrate cp_model_weekly: add avg_anchor_likelihood column
+    try:
+        conn.execute("ALTER TABLE cp_model_weekly ADD COLUMN avg_anchor_likelihood FLOAT")
+    except Exception:
+        pass
     # Migrate interval_hr_stats: add power + boundary columns
     for stmt in [
         "ALTER TABLE interval_hr_stats ADD COLUMN activity_date DATE",
@@ -186,11 +225,11 @@ def get_conn():
 
 
 def append_pmc_rows(pmc_series):
-    """INSERT OR REPLACE last 14 days of PMC into pmc_daily."""
+    """INSERT OR REPLACE all PMC rows into pmc_daily (full history for YoY comparison)."""
     if not pmc_series:
         return
     conn = get_conn()
-    for row in pmc_series[-14:]:
+    for row in pmc_series:
         conn.execute("""
             INSERT INTO pmc_daily (date, tss, ctl, atl, tsb)
             VALUES (?, ?, ?, ?, ?)
@@ -267,6 +306,128 @@ def append_power_curve(curve_data, week_end):
         (curve_data.get(1200) or {}).get("best"),
     ])
     conn.close()
+
+
+def append_power_curve_extended(clean_curve, week_end):
+    """INSERT OR REPLACE one row into power_curve_extended (clean windows only).
+
+    clean_curve values may be dicts {watts, model_watts, likelihood} or plain ints.
+    Stores display watts in the s{d} columns and likelihood in s{d}_likelihood columns.
+    """
+    if not clean_curve:
+        return
+
+    def _watts(v):
+        return v.get("watts") if isinstance(v, dict) else v
+
+    def _lk(v):
+        return v.get("likelihood") if isinstance(v, dict) else None
+
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO power_curve_extended
+            (week_end,
+             s60, s120, s180, s300, s480, s600, s720, s900, s1200,
+             s60_likelihood, s120_likelihood, s180_likelihood, s300_likelihood,
+             s480_likelihood, s600_likelihood, s720_likelihood, s900_likelihood,
+             s1200_likelihood)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (week_end) DO UPDATE SET
+            s60   = EXCLUDED.s60,   s120  = EXCLUDED.s120,
+            s180  = EXCLUDED.s180,  s300  = EXCLUDED.s300,
+            s480  = EXCLUDED.s480,  s600  = EXCLUDED.s600,
+            s720  = EXCLUDED.s720,  s900  = EXCLUDED.s900,
+            s1200 = EXCLUDED.s1200,
+            s60_likelihood   = EXCLUDED.s60_likelihood,
+            s120_likelihood  = EXCLUDED.s120_likelihood,
+            s180_likelihood  = EXCLUDED.s180_likelihood,
+            s300_likelihood  = EXCLUDED.s300_likelihood,
+            s480_likelihood  = EXCLUDED.s480_likelihood,
+            s600_likelihood  = EXCLUDED.s600_likelihood,
+            s720_likelihood  = EXCLUDED.s720_likelihood,
+            s900_likelihood  = EXCLUDED.s900_likelihood,
+            s1200_likelihood = EXCLUDED.s1200_likelihood
+    """, [
+        week_end,
+        _watts(clean_curve.get(60)),   _watts(clean_curve.get(120)),
+        _watts(clean_curve.get(180)),  _watts(clean_curve.get(300)),
+        _watts(clean_curve.get(480)),  _watts(clean_curve.get(600)),
+        _watts(clean_curve.get(720)),  _watts(clean_curve.get(900)),
+        _watts(clean_curve.get(1200)),
+        _lk(clean_curve.get(60)),   _lk(clean_curve.get(120)),
+        _lk(clean_curve.get(180)),  _lk(clean_curve.get(300)),
+        _lk(clean_curve.get(480)),  _lk(clean_curve.get(600)),
+        _lk(clean_curve.get(720)),  _lk(clean_curve.get(900)),
+        _lk(clean_curve.get(1200)),
+    ])
+    conn.close()
+
+
+def append_cp_model(model_result, week_end):
+    """INSERT OR REPLACE one row into cp_model_weekly."""
+    if not model_result:
+        return
+    conn = get_conn()
+    conn.execute("""
+        INSERT INTO cp_model_weekly
+            (week_end, cp_watts, w_prime_kj, k_constant, model_type,
+             r_squared, anchor_count, max_duration_used_s, anchors_only_short,
+             est_20min, est_60min, confidence, avg_anchor_likelihood)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (week_end) DO UPDATE SET
+            cp_watts              = EXCLUDED.cp_watts,
+            w_prime_kj            = EXCLUDED.w_prime_kj,
+            k_constant            = EXCLUDED.k_constant,
+            model_type            = EXCLUDED.model_type,
+            r_squared             = EXCLUDED.r_squared,
+            anchor_count          = EXCLUDED.anchor_count,
+            max_duration_used_s   = EXCLUDED.max_duration_used_s,
+            anchors_only_short    = EXCLUDED.anchors_only_short,
+            est_20min             = EXCLUDED.est_20min,
+            est_60min             = EXCLUDED.est_60min,
+            confidence            = EXCLUDED.confidence,
+            avg_anchor_likelihood = EXCLUDED.avg_anchor_likelihood
+    """, [
+        week_end,
+        model_result.get("cp_watts"),
+        model_result.get("w_prime_kj"),
+        model_result.get("k_constant"),
+        model_result.get("model_type"),
+        model_result.get("r_squared"),
+        model_result.get("anchor_count"),
+        model_result.get("max_duration_used_s"),
+        model_result.get("anchors_only_short"),
+        model_result.get("est_20min"),
+        model_result.get("est_60min"),
+        model_result.get("confidence"),
+        model_result.get("avg_anchor_likelihood"),
+    ])
+    conn.close()
+
+
+def get_cp_model_current():
+    """Return the most recent cp_model_weekly row as a dict, or None."""
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT cp_watts, w_prime_kj, k_constant, model_type, r_squared,
+                   anchor_count, max_duration_used_s, anchors_only_short,
+                   est_20min, est_60min, confidence, week_end
+            FROM cp_model_weekly
+            ORDER BY week_end DESC
+            LIMIT 1
+        """).fetchone()
+    except Exception:
+        conn.close()
+        return None
+    conn.close()
+    if not row:
+        return None
+    keys = ["cp_watts", "w_prime_kj", "k_constant", "model_type", "r_squared",
+            "anchor_count", "max_duration_used_s", "anchors_only_short",
+            "est_20min", "est_60min", "confidence", "week_end"]
+    return dict(zip(keys, row))
 
 
 def append_segment_efforts(segment_list):
@@ -571,6 +732,179 @@ def power_curve_trend():
                                 (600, s600_r, s600_p), (1200, s1200_r, s1200_p)]:
         delta = (recent - prior) if (recent and prior) else None
         result[dur] = {"recent": recent, "prior": prior, "delta": delta}
+    return result
+
+
+def pmc_yoy(target_date, year_offset=1):
+    """
+    Return {ctl, atl, tsb, date} for the same date N years ago, or None if no data.
+    Requires full pmc_daily history (not rolling-14-day). Useful for YoY fitness comparison.
+    """
+    yoy_date = target_date - timedelta(days=365 * year_offset)
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT ctl, atl, tsb FROM pmc_daily WHERE date = ?", [yoy_date]
+        ).fetchone()
+    except Exception:
+        conn.close()
+        return None
+    conn.close()
+    if not row or row[0] is None:
+        return None
+    return {"ctl": row[0], "atl": row[1], "tsb": row[2], "date": yoy_date.isoformat()}
+
+
+def power_curve_yoy(target_date, year_offset=1):
+    """
+    Return {s60, s300, s600, s1200} for the week closest to same date N years ago, or None.
+    Searches within ±14 days of the anniversary date.
+    """
+    yoy_date = target_date - timedelta(days=365 * year_offset)
+    window_start = yoy_date - timedelta(days=14)
+    window_end = yoy_date + timedelta(days=14)
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT s60, s300, s600, s1200
+            FROM power_curve_weekly
+            WHERE week_end BETWEEN ? AND ?
+            ORDER BY week_end DESC
+            LIMIT 1
+        """, [window_start, window_end]).fetchone()
+    except Exception:
+        conn.close()
+        return None
+    conn.close()
+    if not row or all(v is None for v in row):
+        return None
+    return {"s60": row[0], "s300": row[1], "s600": row[2], "s1200": row[3]}
+
+
+def fitness_test_triggers(today=None):
+    """
+    Check conditions that warrant a mid-block fitness test prescription.
+
+    Returns a dict with keys:
+      stale_durations:     list of duration labels with no clean data in power_curve_extended
+                           in the last 6 weeks (checks 5-min and 20-min anchors).
+      atl_drop_pct:        float if ATL dropped >30% peak-to-trough sustained ≥10 days, else None.
+      atl_drop_days:       int — consecutive days ATL was >30% below its 30-day peak. None if no drop.
+      low_model_confidence: bool — True if cp_model_weekly confidence is "low" and anchor_count < 3.
+      anchors_only_short:  bool — True if longest clean CP anchor < 10min (extrapolation zone).
+      max_duration_used_s: int | None — longest clean anchor from cp_model_weekly.
+      model_type:          str | None — "3param" / "2param" / None if no model yet.
+    """
+    from datetime import date as _date
+    today = today or _date.today()
+    cutoff_6wk = today - timedelta(weeks=6)
+
+    conn = get_conn()
+    result = {
+        "stale_durations":      [],
+        "atl_drop_pct":         None,
+        "atl_drop_days":        None,
+        "low_model_confidence": False,
+        "anchors_only_short":   False,
+        "max_duration_used_s":  None,
+        "model_type":           None,
+        "case_a_durations":     [],   # no clean window at all (venue problem)
+        "case_b_durations":     [],   # clean but low likelihood (session structure problem)
+        "duration_likelihoods": {},   # raw per-duration likelihood for inspection
+    }
+
+    # Key durations to assess for Case A/B (seconds → label)
+    _KEY_DURATIONS = {300: "5-min", 480: "8-min", 720: "12-min", 1200: "20-min"}
+    _CASE_B_THRESHOLD = 0.4
+
+    # --- Stale clean power curve durations + Case A/B (uses power_curve_extended) ---
+    try:
+        row = conn.execute("""
+            SELECT
+                MAX(CASE WHEN s300  IS NOT NULL THEN week_end END) AS last_5min,
+                MAX(CASE WHEN s1200 IS NOT NULL THEN week_end END) AS last_20min,
+                MAX(s300_likelihood)  AS lk_300,
+                MAX(s480_likelihood)  AS lk_480,
+                MAX(s720_likelihood)  AS lk_720,
+                MAX(s1200_likelihood) AS lk_1200,
+                MAX(s300)  AS w_300,
+                MAX(s480)  AS w_480,
+                MAX(s720)  AS w_720,
+                MAX(s1200) AS w_1200
+            FROM power_curve_extended
+            WHERE week_end >= ?
+        """, [cutoff_6wk]).fetchone()
+        if row:
+            last_5min, last_20min = row[0], row[1]
+            lk_map = {300: row[2], 480: row[3], 720: row[4], 1200: row[5]}
+            w_map  = {300: row[6], 480: row[7], 720: row[8], 1200: row[9]}
+
+            if last_5min is None or last_5min < cutoff_6wk:
+                result["stale_durations"].append("5-min")
+            if last_20min is None or last_20min < cutoff_6wk:
+                result["stale_durations"].append("20-min")
+
+            for dur_s, label in _KEY_DURATIONS.items():
+                w = w_map.get(dur_s)
+                lk = lk_map.get(dur_s)
+                result["duration_likelihoods"][str(dur_s)] = lk
+                if w is None:
+                    result["case_a_durations"].append(label)
+                elif lk is not None and lk < _CASE_B_THRESHOLD:
+                    result["case_b_durations"].append(label)
+    except Exception:
+        pass
+
+    # --- ATL drop: peak-to-trough in last 30 days ---
+    try:
+        cutoff_30d = today - timedelta(days=30)
+        rows = conn.execute("""
+            SELECT date, atl FROM pmc_daily
+            WHERE date >= ? AND date <= ?
+            ORDER BY date ASC
+        """, [cutoff_30d, today]).fetchall()
+
+        if rows and len(rows) >= 10:
+            atl_values = [(r[0], r[1]) for r in rows if r[1] is not None]
+            if atl_values:
+                peak_atl = max(v for _, v in atl_values)
+                if peak_atl > 0:
+                    threshold = peak_atl * 0.70
+                    max_run = 0
+                    cur_run = 0
+                    trough_atl = None
+                    for _, atl_val in atl_values:
+                        if atl_val < threshold:
+                            cur_run += 1
+                            trough_atl = min(trough_atl, atl_val) if trough_atl is not None else atl_val
+                            max_run = max(max_run, cur_run)
+                        else:
+                            cur_run = 0
+                    if max_run >= 10 and trough_atl is not None:
+                        drop_pct = round((peak_atl - trough_atl) / peak_atl * 100, 1)
+                        result["atl_drop_pct"] = drop_pct
+                        result["atl_drop_days"] = max_run
+    except Exception:
+        pass
+
+    # --- CP model quality from cp_model_weekly ---
+    try:
+        row = conn.execute("""
+            SELECT confidence, anchor_count, anchors_only_short, max_duration_used_s, model_type
+            FROM cp_model_weekly
+            ORDER BY week_end DESC
+            LIMIT 1
+        """).fetchone()
+        if row:
+            confidence, anchor_count, anchors_only_short, max_dur, model_type = row
+            result["model_type"] = model_type
+            result["max_duration_used_s"] = max_dur
+            result["anchors_only_short"] = bool(anchors_only_short)
+            result["low_model_confidence"] = (confidence == "low" and (anchor_count or 0) < 3)
+    except Exception:
+        pass
+
+    conn.close()
     return result
 
 

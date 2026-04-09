@@ -258,7 +258,9 @@ Inspect the LAST DAY ACTUALLY RIDDEN in last week's session_comparison. If it wa
 
 **48-hour rule covers anaerobic sessions too**: Do not schedule a VO2max session within 48 hours of a W′-depleting anaerobic session (efforts >130% FTP with meaningful duration above CP). TSB is a lagging indicator and will not capture acute neuromuscular fatigue from a single hard session — do not use TSB thresholds as the sole guard after maximal anaerobic work.
 
-**Tempo/sweet spot duration progression**: Continuous tempo (75–90% FTP) duration must not increase by more than 15 min relative to the athlete's established maximum in a single session step. If the athlete's current max continuous Z3 is ~12 min, appropriate first steps are 20 min, then 30 min over multiple sessions — not a jump to 60–70 min. Continuous tempo >60 min is appropriate only for athletes with CTL 80+."""
+**Tempo/sweet spot duration progression**: Continuous tempo (75–90% FTP) duration must not increase by more than 15 min relative to the athlete's established maximum in a single session step. If the athlete's current max continuous Z3 is ~12 min, appropriate first steps are 20 min, then 30 min over multiple sessions — not a jump to 60–70 min. Continuous tempo >60 min is appropriate only for athletes with CTL 80+.
+
+**Fitness test prescription**: When the FITNESS TEST TRIGGERS section in the user prompt reports stale power curve data (>6 weeks without a max effort at a key duration) or a sustained ATL drop (>30% for >10 days), you MUST set `test_prescription` in your output. The prescription must be specific — name the format, venue/segment if applicable, and which day this week or next to target. Do NOT prescribe a test in recovery weeks or when TSB < -15. If no triggers are active, set `test_prescription` to null."""
 
 WEEKLY_USER_TEMPLATE = """
 Today is {today} (Monday). Generate this week's coaching report and update the training block.
@@ -273,6 +275,9 @@ Last session actually completed: {last_session_summary}
 - CTL (fitness): {ctl}
 - ATL (fatigue): {atl}
 - TSB (form): {tsb}
+
+## YEAR-OVER-YEAR (same week last year)
+{yoy_data}
 
 ## Last Week Summary
 - Total TSS: {actual_tss} (planned: {planned_tss})
@@ -295,11 +300,20 @@ Use ride_count ({ride_count}) and TSS ({actual_tss}) above as ground truth — d
 ## SEGMENT PROGRESS (KOM targets)
 {segment_progress}
 
+## ATHLETE PHENOTYPE (power-duration profile)
+{phenotype}
+
+## CP MODEL (estimated from clean outdoor efforts)
+{cp_model}
+
 ## ATHLETE FEEDBACK — STRAVA RIDE DESCRIPTIONS (last 7 days)
 {strava_descriptions}
 
 ## MID-WEEK CHECK-IN
 {checkin_data}
+
+## FITNESS TEST TRIGGERS
+{fitness_test_triggers}
 
 ## AEROBIC EFFICIENCY + HR RESPONSE (structured signals)
 {ef_hr_signals}
@@ -369,9 +383,27 @@ Return a JSON object exactly matching this schema:
     "coaches_note": {{
       "headline": "short direct headline",
       "body": "1-2 sentences max. Specific, actionable. What to focus on this week and why."
-    }}
+    }},
+    "test_prescription": null
   }}
 }}
+
+`test_prescription` rules:
+- Set to null if NO fitness test trigger is active (the normal case).
+- Set to an object only when one or more trigger conditions are present in FITNESS TEST TRIGGERS:
+  - Stale 20-min data (>6 weeks): prescribe a 20-min all-out TT or max climb (match athlete's stated preference from preferences.md).
+  - Stale 5-min data (>6 weeks): prescribe 2x all-out 5-min efforts with full recovery.
+  - ATL drop >30% for >10 days: prescribe a ramp test (safest when fatigued) to re-anchor fitness before building load.
+  - If both stale durations are triggered, address both in one prescription.
+- When prescribing, be SPECIFIC: name the format, the segment/venue if known from preferences.md (Pantoll for 20-min climbs), and why we need it.
+- Schema when active:
+  {{
+    "trigger": "stale_20min|stale_5min|stale_both|atl_drop",
+    "urgency": "this_week|next_week",
+    "format": "ramp_test|20min_tt|5min_efforts|max_climb",
+    "headline": "short punchy headline (e.g. 'Time to test — FTP anchor needed')",
+    "instruction": "Specific, direct instruction. Include venue/segment name, how many reps, when in the week."
+  }}
 
 Session rules (same as block generation):
 - Plan 5 required sessions; Tuesday OR Thursday is the weekday rest day
@@ -439,7 +471,9 @@ def generate_weekly_email(pmc_current, last_week_actual, last_week_planned_tss,
                           session_comparison=None, hr_data=None,
                           strava_descriptions=None, checkin_data=None,
                           compliance_history=None, segment_data=None,
-                          ef_data=None, interval_hr_data=None, rpe_signals=None):
+                          ef_data=None, interval_hr_data=None, rpe_signals=None,
+                          phenotype_data=None, yoy_data=None,
+                          fitness_test_triggers=None, cp_model_data=None):
     """
     Generate weekly coaching email + update plan.
     Returns email content dict.
@@ -595,6 +629,141 @@ def generate_weekly_email(pmc_current, last_week_actual, last_week_planned_tss,
             )
     rpe_signals_str = "\n".join(rpe_lines) if rpe_lines else "  No ride descriptions with RPE signals this week."
 
+    # Format phenotype data
+    if phenotype_data and phenotype_data.get("primary") != "unknown":
+        p = phenotype_data
+        secondary_str = f" / secondary: {p['secondary']}" if p.get("secondary") else ""
+        phenotype_str = (
+            f"  Primary type: {p['primary']}{secondary_str}\n"
+            f"  Best KOM targets: {p['best_kom_label']}\n"
+            f"  Rationale: {p['rationale']}"
+        )
+    else:
+        phenotype_str = "  Not computed yet — need ≥3 power curve data points."
+
+    # Format YoY comparison
+    if yoy_data:
+        yoy_lines = []
+        yoy_pmc = yoy_data.get("pmc")
+        yoy_curve = yoy_data.get("curve")
+        if yoy_pmc:
+            ctl_delta = round(pmc_current.get("ctl", 0) - yoy_pmc["ctl"], 1)
+            sign = "+" if ctl_delta >= 0 else ""
+            yoy_lines.append(
+                f"  CTL: {yoy_pmc['ctl']} → {pmc_current.get('ctl', 0)} ({sign}{ctl_delta}) "
+                f"[same week {yoy_pmc['date'][:4]}]"
+            )
+            atl_delta = round(pmc_current.get("atl", 0) - yoy_pmc["atl"], 1)
+            sign = "+" if atl_delta >= 0 else ""
+            yoy_lines.append(
+                f"  ATL: {yoy_pmc['atl']} → {pmc_current.get('atl', 0)} ({sign}{atl_delta})"
+            )
+        if yoy_curve:
+            yoy_lines.append(
+                f"  Power curve last year — 1min: {yoy_curve.get('s60', '?')}w | "
+                f"5min: {yoy_curve.get('s300', '?')}w | "
+                f"10min: {yoy_curve.get('s600', '?')}w | "
+                f"20min: {yoy_curve.get('s1200', '?')}w"
+            )
+        yoy_data_str = "\n".join(yoy_lines) if yoy_lines else "  No prior-year data yet."
+    else:
+        yoy_data_str = "  No prior-year data yet (first year of tracking)."
+
+    # Format fitness test triggers
+    if fitness_test_triggers:
+        trigger_lines = []
+        stale = fitness_test_triggers.get("stale_durations", [])
+        if stale:
+            trigger_lines.append(
+                f"  STALE POWER DATA: No max effort recorded at [{', '.join(stale)}] "
+                f"in the last 6 weeks. CP/FTP model may be anchored on stale data."
+            )
+        else:
+            trigger_lines.append("  Power curve freshness: OK (max effort at all key durations within 6 weeks).")
+        drop_pct = fitness_test_triggers.get("atl_drop_pct")
+        drop_days = fitness_test_triggers.get("atl_drop_days")
+        if drop_pct is not None and drop_days is not None:
+            trigger_lines.append(
+                f"  ATL DROP: ATL has dropped {drop_pct}% from its 30-day peak "
+                f"and has been >30% below peak for {drop_days} consecutive days. "
+                f"Possible extended rest, illness, or detraining."
+            )
+        else:
+            trigger_lines.append("  ATL trend: No sustained ATL drop detected.")
+
+        # Case A: no clean window at all (venue problem)
+        case_a = fitness_test_triggers.get("case_a_durations", [])
+        if case_a:
+            trigger_lines.append(
+                f"  CASE A — NO CLEAN WINDOW: [{', '.join(case_a)}] — no uninterrupted "
+                f"effort found in 6 weeks at these durations. Requires a route with "
+                f"sustained climbing (Pantoll / Hawk Hill). Prescribe a dedicated Marin ride."
+            )
+
+        # Case B: clean window exists but low likelihood (session structure problem)
+        case_b = fitness_test_triggers.get("case_b_durations", [])
+        dur_lk = fitness_test_triggers.get("duration_likelihoods", {})
+        if case_b:
+            for label in case_b:
+                # Map label to duration_s key
+                dur_map = {"5-min": "300", "8-min": "480", "12-min": "720", "20-min": "1200"}
+                lk_key = dur_map.get(label, "")
+                lk_val = dur_lk.get(lk_key)
+                lk_str = f" (likelihood={lk_val:.2f})" if lk_val is not None else ""
+                trigger_lines.append(
+                    f"  CASE B — LOW QUALITY: {label}{lk_str} — a clean window exists but "
+                    f"came from a fatigued or low-intensity context. Prescribe a FRESH "
+                    f"standalone {label} effort at the START of the next Twin Peaks / Bernal "
+                    f"ride, before any other work. Do NOT add to existing intensity — replace "
+                    f"the lightest planned intensity session, or defer if TSB < 0."
+                )
+
+        fitness_test_triggers_str = "\n".join(trigger_lines)
+    else:
+        fitness_test_triggers_str = "  No trigger data available."
+
+    # Format CP model data
+    def _prescribe_anchor(max_dur_s):
+        """Return (duration_s, venue) for the next anchor prescription given current best."""
+        if max_dur_s < 480:
+            return min(int(max_dur_s * 1.5), 480), "Twin Peaks / Bernal"
+        elif max_dur_s < 600:
+            return 600, "Twin Peaks full loop"
+        elif max_dur_s < 900:
+            return 900, "Twin Peaks full loop"
+        else:
+            return 1200, "Pantoll / Hawk Hill (requires planning — 20-min graduation step)"
+
+    if cp_model_data:
+        m = cp_model_data
+        k_str = f" | k={m['k_constant']}s" if m.get("k_constant") is not None else ""
+        est_note = " [EXTRAPOLATED — no anchor ≥10min]" if m.get("anchors_only_short") else ""
+        max_dur_min = (m.get("max_duration_used_s") or 0) // 60
+        avg_lk = m.get("avg_anchor_likelihood")
+        avg_lk_str = f" | avg anchor likelihood={avg_lk:.2f}" if avg_lk is not None else ""
+        cp_lines = [
+            f"  Model: {m['model_type']} | R²={m['r_squared']} | "
+            f"{m['anchor_count']} anchors | confidence={m['confidence']} | "
+            f"longest anchor={max_dur_min}min{avg_lk_str}",
+            f"  CP={m['cp_watts']}w | W'={m['w_prime_kj']}kJ{k_str}",
+            f"  Est. 20-min: {m['est_20min']}w{est_note} | "
+            f"Est. 60-min: {m['est_60min']}w{est_note}",
+        ]
+        if m.get("caveat"):
+            cp_lines.append(f"  ⚠ {m['caveat']}")
+        if m.get("anchors_only_short"):
+            max_dur_s = m.get("max_duration_used_s") or 300
+            target_dur_s, venue = _prescribe_anchor(max_dur_s)
+            target_dur_min = target_dur_s // 60
+            cp_lines.append(
+                f"  PRESCRIPTION NEEDED: To improve model accuracy, prescribe a "
+                f"{target_dur_min}-min sustained effort at {venue}. Frame as CP anchor "
+                f"improvement. Replace lightest planned intensity session; defer if TSB < 0."
+            )
+        cp_model_str = "\n".join(cp_lines)
+    else:
+        cp_model_str = "  No CP model yet — insufficient clean anchor data (need ≥3 points spanning ≥3× duration range)."
+
     user_prompt = WEEKLY_USER_TEMPLATE.format(
         today=today,
         last_session_summary=last_session_summary,
@@ -612,8 +781,12 @@ def generate_weekly_email(pmc_current, last_week_actual, last_week_planned_tss,
         hr_data=hr_data_str,
         compliance_history=compliance_history or "  No compliance history yet.",
         segment_progress=_format_segment_progress(segment_data),
+        phenotype=phenotype_str,
+        yoy_data=yoy_data_str,
         strava_descriptions=strava_descriptions_str,
         checkin_data=checkin_data_str,
+        fitness_test_triggers=fitness_test_triggers_str,
+        cp_model=cp_model_str,
         ef_hr_signals=ef_hr_signals_str,
         rpe_signals=rpe_signals_str,
         plan_json=json.dumps(
@@ -634,6 +807,162 @@ def generate_weekly_email(pmc_current, last_week_actual, last_week_planned_tss,
         print("Training block updated.")
 
     return result.get("email", {}), updated_plan
+
+
+# ---------------------------------------------------------------------------
+# Mid-week adaptive replan
+# ---------------------------------------------------------------------------
+
+REPLAN_SYSTEM = """You are a professional cycling coach. A mid-week replan has been triggered.
+Your job is to make the minimum necessary adjustments to the remaining days of this week.
+
+## Core Dampening Rules
+- Do NOT rebuild the week from scratch — only change what the data clearly demands
+- Prefer reducing reps or adjusting target watts ±5-10% over swapping session types
+- Do not reduce remaining-week TSS by more than 15% from what was originally planned
+- Do not add a hard session (vo2max/anaerobic) within 48h of another hard session
+- Preserve the number of Z2 hours within ±20 min total
+- Do not shift any session by more than 1 day
+- If sessions were HIT or near-HIT, leave them unchanged — only react to clear MISS/PARTIAL patterns backed by power data
+- If today's session is already planned as rest, do not insert training
+
+## Physiological Constraints (enforce strictly)
+**W′ budget**: Compound anaerobic blocks: Σ[(target_w − CP) × duration_s] ≤ 18,000 J per block. CP ≈ FTP − 10w.
+**Rest ratio**: Efforts >130% FTP require minimum 2:1 rest:work.
+**48-hour rule**: No vo2max/anaerobic within 48h of another hard session. TSB is a lagging metric — do not override this with TSB alone.
+**Tempo progression**: Do not jump continuous tempo >15 min beyond athlete's established max (~12 min).
+
+Output only valid JSON — no commentary before or after."""
+
+REPLAN_USER_TEMPLATE = """
+Today is {today} ({today_day}). Replan the remaining days of this week based on completed session data.
+
+## Athlete Profile
+{preferences}
+
+## Current PMC
+- CTL: {ctl} | ATL: {atl} | TSB: {tsb}
+
+## Completed Sessions This Week (objective data)
+{completed_sessions}
+
+## Remaining Sessions This Week (to potentially adjust)
+{remaining_sessions}
+
+## Output Format
+Return a JSON object:
+{{
+  "replan_reason": "1-2 sentences: what the data shows and what you're changing (be specific about watts and reps)",
+  "adjusted_sessions": [
+    {{
+      "day": "wednesday",
+      "type": "vo2max|anaerobic|z2|tempo|sweet_spot|rest",
+      "duration_min": 60,
+      "zone_label": "Z5",
+      "target_watts": 355,
+      "target_watts_range": [340, 380],
+      "environment": "flexible",
+      "optional": false,
+      "interval_minutes": [10, 20, 10],
+      "interval_sets": [{{"count": 4, "duration_s": 240, "target_watts": 355, "rest_s": 240}}],
+      "description": "• Warmup: 10min Z1\\n• Main: 4x4min Z5\\n• Cooldown: 10min Z1\\n• Focus: ..."
+    }}
+  ]
+}}
+
+Only include days you are actually changing. Omit unchanged days.
+If no changes are warranted, return an empty adjusted_sessions list with replan_reason explaining why.
+Enforce all standard session schema rules (interval_sets required for vo2max/anaerobic/tempo/sweet_spot; warmup_min/cooldown_min for z2/z1; interval_minutes must sum to duration_min).
+"""
+
+
+def generate_replan(pmc_current, completed_sessions, remaining_sessions, descriptions=None):
+    """
+    Generate mid-week plan adjustments based on completed session power actuals + descriptions.
+    Returns dict: {replan_reason: str, adjusted_sessions: list of session dicts}.
+    """
+    prefs = _load_preferences()
+    today = date.today()
+    today_day = today.strftime("%A")
+
+    # Format completed sessions
+    completed_lines = []
+    for day in completed_sessions:
+        p = day.get("planned") or {}
+        a = day.get("actual")
+        status = day.get("status", "")
+        day_str = day.get("day", "?").capitalize()
+
+        if p.get("type") == "rest" and not a:
+            completed_lines.append(f"  {day_str}: REST (planned)")
+            continue
+
+        planned_str = (
+            f"{p.get('type', '').upper()} {p.get('duration_min', 0)}min "
+            f"target {p.get('target_watts', '?')}w"
+        ) if p else "—"
+
+        if a:
+            istats = a.get("interval_stats") or {}
+            efforts = istats.get("efforts_detected", 0)
+            avg_w = istats.get("avg_interval_watts")
+            target_w = istats.get("target_watts")
+            pct = istats.get("pct_delta")
+            interval_str = ""
+            if efforts and avg_w and target_w:
+                sign = "+" if pct and pct >= 0 else ""
+                interval_str = (
+                    f" | intervals: {efforts} efforts avg {avg_w}w "
+                    f"vs target {target_w}w ({sign}{pct}%)"
+                )
+            completed_lines.append(
+                f"  {day_str}: {planned_str} → actual {a.get('duration_min', 0)}min "
+                f"{a.get('avg_watts', '?')}w avg TSS={a.get('tss', '?')}{interval_str} [{status.upper()}]"
+            )
+        else:
+            completed_lines.append(f"  {day_str}: {planned_str} → NO RIDE [MISS]")
+
+    # Append ride descriptions to completed sessions context
+    if descriptions:
+        completed_lines.append("\n  Ride descriptions:")
+        for d in descriptions:
+            if d.get("description"):
+                completed_lines.append(f"    {d['date']} — {d['ride_name']}: {d['description']}")
+
+    # Format remaining sessions
+    remaining_lines = []
+    for session in remaining_sessions:
+        day_str = session.get("day", "?").capitalize()
+        s_type = session.get("type", "?")
+        if s_type == "rest":
+            remaining_lines.append(f"  {day_str}: REST")
+            continue
+        isets = session.get("interval_sets")
+        isets_str = ""
+        if isets:
+            isets_str = " | sets: " + ", ".join(
+                f"{s['count']}x{s['duration_s']}s@{s['target_watts']}w"
+                for s in isets
+            )
+        remaining_lines.append(
+            f"  {day_str}: {s_type.upper()} {session.get('duration_min', 0)}min "
+            f"target {session.get('target_watts', '?')}w{isets_str}"
+        )
+
+    user_prompt = REPLAN_USER_TEMPLATE.format(
+        today=today.isoformat(),
+        today_day=today_day,
+        preferences=prefs,
+        ctl=pmc_current.get("ctl", 0),
+        atl=pmc_current.get("atl", 0),
+        tsb=pmc_current.get("tsb", 0),
+        completed_sessions="\n".join(completed_lines) or "  No sessions completed yet this week.",
+        remaining_sessions="\n".join(remaining_lines) or "  No remaining sessions this week.",
+    )
+
+    print("Generating mid-week replan with Claude...")
+    raw = _call_claude(REPLAN_SYSTEM, user_prompt)
+    return json.loads(_strip_markdown_json(raw))
 
 
 # ---------------------------------------------------------------------------

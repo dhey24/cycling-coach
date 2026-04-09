@@ -144,6 +144,8 @@ def run(init_mode=False, dry_run=False):
     rpe_signals = None
     curve_trend = None
     curve_data = {}
+    cp_model_data = None
+    phenotype_data = None
     is_recovery_week = False
     try:
         # Determine recovery week from PMC
@@ -182,10 +184,37 @@ def run(init_mode=False, dry_run=False):
         db_module.append_power_curve(curve_data, date.today())
         print("DB: power curve written.")
 
+        # Extended clean power curve + CP model (additive — does not touch power_curve_weekly)
+        try:
+            max_hr = metrics.load_max_hr()
+            clean_curve = metrics.power_curve_extended(
+                activities, strava_client.fetch_power_stream, ftp_outdoor=ftp_outdoor,
+                fetch_hr_fn=strava_client.fetch_hr_stream, max_hr=max_hr,
+            )
+            cp_model_data = metrics.fit_cp_model(clean_curve)
+            db_module.append_power_curve_extended(clean_curve, date.today())
+            if cp_model_data:
+                db_module.append_cp_model(cp_model_data, date.today())
+                print(
+                    f"CP model: {cp_model_data['model_type']} | "
+                    f"CP={cp_model_data['cp_watts']}w | W'={cp_model_data['w_prime_kj']}kJ | "
+                    f"R²={cp_model_data['r_squared']:.3f} | "
+                    f"anchors={cp_model_data['anchor_count']} | "
+                    f"confidence={cp_model_data['confidence']}"
+                )
+            else:
+                print("CP model: insufficient clean anchor data (need ≥3 points, span ≥3×).")
+        except Exception as e:
+            print(f"Extended power curve / CP model failed (non-fatal): {e}")
+            cp_model_data = None
+
         # Query trend data for email
         ef_data = db_module.ef_trend(weeks=4)
         interval_hr_data = db_module.interval_hr_trend(weeks=4)
         curve_trend = db_module.power_curve_trend()
+
+        phenotype_data = metrics.compute_power_phenotype(curve_data)
+        print(f"Phenotype: {phenotype_data['primary']} — {phenotype_data['best_kom_label']}")
     except Exception as e:
         print(f"HR/EF analysis failed (non-fatal): {e}")
         # Fall back to power curve without stream caching benefit
@@ -197,6 +226,17 @@ def run(init_mode=False, dry_run=False):
                 )
             except Exception:
                 curve_data = {}
+
+    # 4b. YoY comparison (non-fatal — no data in year 1)
+    yoy_data = None
+    try:
+        yoy_pmc = db_module.pmc_yoy(date.today())
+        yoy_curve = db_module.power_curve_yoy(date.today())
+        if yoy_pmc or yoy_curve:
+            yoy_data = {"pmc": yoy_pmc, "curve": yoy_curve}
+            print(f"YoY data: CTL {(yoy_pmc or {}).get('ctl', '?')} (last year)")
+    except Exception as e:
+        print(f"YoY query failed (non-fatal): {e}")
 
     # 4c. Ride descriptions for feedback signal + RPE inference (done after session_comparison)
     strava_descriptions = metrics.collect_ride_descriptions(
@@ -252,6 +292,19 @@ def run(init_mode=False, dry_run=False):
     block_overview    = None
     session_comparison = None
 
+    # Fitness test triggers (non-fatal)
+    fitness_test_triggers = None
+    try:
+        fitness_test_triggers = db_module.fitness_test_triggers()
+        stale = fitness_test_triggers.get("stale_durations", [])
+        drop = fitness_test_triggers.get("atl_drop_pct")
+        if stale or drop:
+            print(f"Fitness test triggers: stale={stale} atl_drop={drop}%")
+        else:
+            print("Fitness test triggers: none active")
+    except Exception as e:
+        print(f"Fitness test trigger check failed (non-fatal): {e}")
+
     # 6. Generate plan / email via Claude
     # Fetch block-level history for generate_block() context (non-fatal)
     block_history = ""
@@ -296,6 +349,9 @@ def run(init_mode=False, dry_run=False):
             segment_data=segment_tracker,
             ef_data=ef_data, interval_hr_data=interval_hr_data,
             rpe_signals=rpe_signals,
+            phenotype_data=phenotype_data, yoy_data=yoy_data,
+            fitness_test_triggers=fitness_test_triggers,
+            cp_model_data=cp_model_data,
         )
     else:
         current_plan       = coach._load_plan()
@@ -374,6 +430,9 @@ def run(init_mode=False, dry_run=False):
             segment_data=segment_tracker,
             ef_data=ef_data, interval_hr_data=interval_hr_data,
             rpe_signals=rpe_signals,
+            phenotype_data=phenotype_data, yoy_data=yoy_data,
+            fitness_test_triggers=fitness_test_triggers,
+            cp_model_data=cp_model_data,
         )
 
     # Log coaching history (non-fatal)
@@ -413,6 +472,7 @@ def run(init_mode=False, dry_run=False):
         rpe_signals=rpe_signals,
         curve_trend=curve_trend,
         is_recovery_week=is_recovery_week,
+        test_prescription=email_content.get("test_prescription"),
     )
 
     # 8. Send or print

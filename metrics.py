@@ -1038,6 +1038,383 @@ def power_curve(activities, fetch_stream_fn, weeks=8,
 
 
 # ---------------------------------------------------------------------------
+# Extended power curve + CP model (clean-window, multi-duration)
+# ---------------------------------------------------------------------------
+
+_EXTENDED_DURATIONS = [60, 120, 180, 300, 480, 600, 720, 900, 1200]
+
+
+def _is_clean_window(watts_slice, ftp,
+                     dead_floor_pct=0.25, max_dead_frac=0.05,
+                     coherence_pct=0.70, coherence_window_s=15):
+    """
+    Return True if this power window is clean enough to use as a CP model anchor.
+
+    Layer 1 — hard stops: any second below ftp * dead_floor_pct counts as 'dead'.
+    If more than max_dead_frac of the window is dead → reject.
+
+    Layer 2 — coherence: no 15-second sub-window should drop below coherence_pct
+    of the overall window mean. Catches 'sprint then collapse' windows.
+    """
+    dead_floor = ftp * dead_floor_pct
+    n = len(watts_slice)
+
+    # Layer 1
+    dead_count = int(np.sum(watts_slice < dead_floor))
+    if dead_count / n > max_dead_frac:
+        return False
+
+    # Layer 2
+    window_mean = float(watts_slice.mean())
+    if window_mean <= 0:
+        return False
+    coherence_floor = window_mean * coherence_pct
+    step = coherence_window_s
+    for start in range(0, n - step + 1, step):
+        sub_mean = float(watts_slice[start:start + step].mean())
+        if sub_mean < coherence_floor:
+            return False
+
+    return True
+
+
+def _preceding_tss(watts_arr, idx, ftp):
+    """
+    Estimate TSS accumulated in the ride before the candidate window at index idx.
+    Uses NP-based TSS on a 30-second rolling average of preceding watts.
+    Returns 0.0 for windows near the start of a ride (< 30s of preceding data).
+    """
+    preceding = watts_arr[:idx]
+    if len(preceding) < 30:
+        return 0.0
+    rolling = np.convolve(preceding, np.ones(30) / 30, mode="valid")
+    np_watts = float(np.mean(rolling ** 4) ** 0.25)
+    return (len(preceding) * np_watts ** 2) / (ftp ** 2 * 3600) * 100
+
+
+def _hr_effort_score(hr_slice, duration_s, max_hr):
+    """
+    Duration-specific HR quality score for a clean power window.
+
+    Returns float 0.2–1.2, or None if duration is too short for HR to be informative.
+    - < 150s: return None (HR lag dominates too much of the window)
+    - 150–480s: check fraction of last 40% above 88% max HR
+    - > 480s: check fraction of last 40% above 85% max HR (threshold HR range)
+    - HR absent: returns None (caller defaults to 0.5)
+    """
+    if duration_s < 150:
+        return None
+    if hr_slice is None or len(hr_slice) == 0:
+        return None
+
+    last_40_start = int(len(hr_slice) * 0.60)
+    last_40 = hr_slice[last_40_start:]
+    if len(last_40) == 0:
+        return None
+
+    threshold = max_hr * (0.88 if duration_s <= 480 else 0.85)
+    frac_above = float(np.sum(last_40 >= threshold) / len(last_40))
+
+    if frac_above >= 0.6:
+        return 1.1
+    elif frac_above >= 0.3:
+        return 0.7
+    else:
+        return 0.3
+
+
+def _max_effort_likelihood(watts_arr, hr_arr, idx, duration_s, ftp, max_hr):
+    """
+    Combine HR effort score and preceding-TSS fatigue penalty into a single 0.0–1.0
+    likelihood that this clean window represents a genuine near-max effort.
+
+    HR score (duration-adjusted) × TSS fatigue multiplier, clamped to [0, 1].
+    """
+    tss = _preceding_tss(watts_arr, idx, ftp)
+    if tss < 30:
+        tss_mult = 1.00
+    elif tss < 60:
+        tss_mult = 0.85
+    elif tss < 90:
+        tss_mult = 0.65
+    else:
+        tss_mult = 0.45
+
+    hr_slice = hr_arr[idx:idx + duration_s] if hr_arr is not None else None
+    hr_score = _hr_effort_score(hr_slice, duration_s, max_hr)
+    if hr_score is None:
+        hr_score = 0.5  # unknown — don't penalise
+
+    return min(1.0, hr_score * tss_mult)
+
+
+def power_curve_extended(activities, fetch_stream_fn, ftp_outdoor, weeks=8,
+                         fetch_hr_fn=None, max_hr=193):
+    """
+    Compute best *clean* rolling-average power at each duration for outdoor rides.
+
+    Uses a wider set of durations than power_curve() and applies _is_clean_window()
+    before accepting a candidate as the best at that duration. Only clean windows
+    (no hard stops, no large mid-window power collapses) are recorded.
+
+    Tracks two candidates per duration:
+    - best_display: highest raw watts (used for email/DB display)
+    - best_model:   highest watts × likelihood (used as CP model anchor)
+
+    Returns dict: {duration_s: {"watts": int|None, "model_watts": int|None, "likelihood": float|None}}
+    Streams are expected to already be cached from the power_curve() call that runs
+    first in main.py, so this is computationally free.
+    """
+    today = date.today()
+    cutoff = today - timedelta(weeks=weeks)
+
+    outdoor_rides = []
+    for a in activities:
+        if a.get("type") != "Ride":
+            continue
+        if a.get("trainer", False):
+            continue
+        try:
+            rd = date.fromisoformat(a.get("start_date_local", "")[:10])
+        except ValueError:
+            continue
+        if rd >= cutoff:
+            outdoor_rides.append((rd, a))
+
+    outdoor_rides.sort(key=lambda x: x[0], reverse=True)
+
+    # Per-duration tracking: display best (raw watts) and model best (watts × likelihood)
+    best_display = {d: 0.0 for d in _EXTENDED_DURATIONS}
+    best_model_score = {d: 0.0 for d in _EXTENDED_DURATIONS}  # watts × likelihood
+    best_model_watts = {d: 0.0 for d in _EXTENDED_DURATIONS}
+    best_likelihood = {d: None for d in _EXTENDED_DURATIONS}
+    uncached_fetches = 0
+
+    for _rd, ride in outdoor_rides:
+        if ride.get("moving_time", 0) < min(_EXTENDED_DURATIONS):
+            continue
+
+        cache_file = os.path.join(_STREAM_CACHE_DIR, f"stream_{ride['id']}.json")
+        is_cached = os.path.exists(cache_file)
+        if not is_cached:
+            if uncached_fetches >= _MAX_UNCACHED_FETCHES:
+                continue
+            uncached_fetches += 1
+
+        watts = fetch_stream_fn(ride["id"])
+        if not watts:
+            continue
+
+        watts_arr = np.array(watts, dtype=float)
+
+        # Fetch HR stream for this ride (cached; None if unavailable)
+        hr_arr = None
+        if fetch_hr_fn is not None:
+            try:
+                hr_raw = fetch_hr_fn(ride["id"])
+                if hr_raw:
+                    hr_raw_arr = np.array(hr_raw, dtype=float)
+                    # Align lengths (Strava streams should match but guard edge cases)
+                    min_len = min(len(watts_arr), len(hr_raw_arr))
+                    hr_arr = hr_raw_arr[:min_len]
+                    watts_arr = watts_arr[:min_len]
+            except Exception:
+                pass
+
+        for d in _EXTENDED_DURATIONS:
+            if len(watts_arr) < d:
+                continue
+            kernel  = np.ones(d) / d
+            rolling = np.convolve(watts_arr, kernel, mode="valid")
+
+            # Scan all clean windows; track best by raw watts and best by watts×likelihood
+            sorted_idx = np.argsort(rolling)[::-1]
+            for idx in sorted_idx[:20]:  # check top-20 candidates only
+                candidate_w = float(rolling[idx])
+                window_slice = watts_arr[idx:idx + d]
+                if not _is_clean_window(window_slice, ftp_outdoor):
+                    continue
+
+                # Display best: highest raw clean watts
+                if candidate_w > best_display[d]:
+                    best_display[d] = candidate_w
+
+                # Model best: highest watts × likelihood
+                likelihood = _max_effort_likelihood(
+                    watts_arr, hr_arr, int(idx), d, ftp_outdoor, max_hr
+                )
+                score = candidate_w * likelihood
+                if score > best_model_score[d]:
+                    best_model_score[d] = score
+                    best_model_watts[d] = candidate_w
+                    best_likelihood[d] = likelihood
+
+    result = {}
+    for d in _EXTENDED_DURATIONS:
+        result[d] = {
+            "watts":       round(best_display[d]) if best_display[d] > 0 else None,
+            "model_watts": round(best_model_watts[d]) if best_model_watts[d] > 0 else None,
+            "likelihood":  round(best_likelihood[d], 3) if best_likelihood[d] is not None else None,
+        }
+    return result
+
+
+def fit_cp_model(clean_curve):
+    """
+    Fit a Critical Power model to clean power data from power_curve_extended().
+
+    Tries the 3-parameter model P(t) = CP + W'/(t+k) first (corrects for curvature
+    at short durations). Falls back to 2-parameter P(t) = CP + W'/t if 3-param
+    fails to converge or produces a poor fit.
+
+    Requires ≥3 anchor points spanning a duration ratio ≥3×. Returns None if
+    insufficient data.
+
+    Returns dict with cp_watts, w_prime_kj, model_type, r_squared, anchor_count,
+    max_duration_used_s, anchors_only_short, est_20min, est_60min, confidence,
+    and caveat string.
+    """
+    try:
+        from scipy.optimize import curve_fit
+        _scipy_available = True
+    except ImportError:
+        _scipy_available = False
+
+    # Collect valid anchor points — use model_watts if available (weighted candidate),
+    # fall back to watts (old flat-dict format from pre-Step-8 callers)
+    anchors = []
+    anchor_likelihoods = []
+    for d, v in clean_curve.items():
+        if isinstance(v, dict):
+            w = v.get("model_watts") or v.get("watts")
+            lk = v.get("likelihood")
+        else:
+            w = v  # legacy flat-dict format
+            lk = None
+        if w is not None and w > 0:
+            anchors.append((d, w))
+            anchor_likelihoods.append(lk)
+    anchors = sorted(zip(anchors, anchor_likelihoods), key=lambda x: x[0][0])
+    anchor_likelihoods = [x[1] for x in anchors]
+    anchors = [x[0] for x in anchors]
+
+    if len(anchors) < 3:
+        return None
+
+    t_arr = np.array([a[0] for a in anchors], dtype=float)
+    p_arr = np.array([a[1] for a in anchors], dtype=float)
+
+    duration_span = t_arr[-1] / t_arr[0]
+    if duration_span < 3.0:
+        return None  # anchors too clustered to constrain the hyperbola
+
+    max_dur = int(t_arr[-1])
+    anchors_only_short = max_dur < 600  # no anchor ≥ 10 min
+
+    def _r_squared(p_measured, p_predicted):
+        ss_res = np.sum((p_measured - p_predicted) ** 2)
+        ss_tot = np.sum((p_measured - p_measured.mean()) ** 2)
+        return float(1 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # Build likelihood weights (default 0.5 for unknown/missing HR)
+    w_raw = np.array([lk if lk is not None else 0.5 for lk in anchor_likelihoods])
+    w_sqrt = np.sqrt(w_raw)
+    avg_anchor_likelihood = float(np.mean(w_raw))
+
+    # --- 2-parameter baseline: P*t = CP*t + W' (weighted linearised) ---
+    A = np.column_stack([t_arr, np.ones_like(t_arr)])
+    b = p_arr * t_arr
+    A_w = A * w_sqrt[:, None]
+    b_w = b * w_sqrt
+    result_2p, _, _, _ = np.linalg.lstsq(A_w, b_w, rcond=None)
+    cp_2p = float(result_2p[0])
+    w_prime_2p = float(result_2p[1])
+
+    # Sanity clamp
+    cp_2p = max(150.0, min(500.0, cp_2p))
+    w_prime_2p = max(5000.0, min(80000.0, w_prime_2p))
+
+    p_pred_2p = cp_2p + w_prime_2p / t_arr
+    r2_2p = _r_squared(p_arr, p_pred_2p)
+
+    # --- 3-parameter model: P(t) = CP + W'/(t+k) ---
+    cp_final = cp_2p
+    w_prime_final = w_prime_2p
+    k_final = None
+    r2_final = r2_2p
+    model_type = "2param"
+
+    if _scipy_available and len(anchors) >= 3:
+        def _cp3(t, cp, wp, k):
+            return cp + wp / (t + k)
+
+        try:
+            p0 = [cp_2p, w_prime_2p, 30.0]
+            bounds = ([150, 5000, 0], [500, 80000, 300])
+            sigma = 1.0 / w_sqrt  # lower sigma = higher confidence anchor
+            popt, _ = curve_fit(_cp3, t_arr, p_arr, p0=p0, bounds=bounds,
+                                sigma=sigma, absolute_sigma=False, maxfev=5000)
+            cp_3p, w_prime_3p, k_3p = float(popt[0]), float(popt[1]), float(popt[2])
+            p_pred_3p = _cp3(t_arr, cp_3p, w_prime_3p, k_3p)
+            r2_3p = _r_squared(p_arr, p_pred_3p)
+
+            # Accept 3-param if it's better and k is physically sensible
+            if r2_3p >= 0.85 and r2_3p >= r2_2p - 0.01 and 0 <= k_3p <= 300:
+                cp_final = cp_3p
+                w_prime_final = w_prime_3p
+                k_final = k_3p
+                r2_final = r2_3p
+                model_type = "3param"
+        except Exception:
+            pass  # curve_fit failed — stay with 2-param
+
+    # Estimated power at 20-min and 60-min from the fitted model
+    def _est(t_s):
+        if model_type == "3param":
+            return round(cp_final + w_prime_final / (t_s + k_final))
+        return round(cp_final + w_prime_final / t_s)
+
+    est_20min = _est(1200)
+    est_60min = _est(3600)
+
+    # Confidence scoring
+    anchor_count = len(anchors)
+    if anchor_count >= 5 and duration_span >= 5 and max_dur >= 600 and r2_final >= 0.95:
+        confidence = "high"
+    elif anchor_count >= 3 and duration_span >= 3 and r2_final >= 0.88:
+        confidence = "moderate"
+    else:
+        confidence = "low"
+
+    # Human-readable caveat
+    caveat = None
+    if anchors_only_short:
+        caveat = (f"All clean anchors are <10min (longest: {max_dur // 60}min) — "
+                  f"est_20min and est_60min are pure extrapolation with high uncertainty.")
+    elif model_type == "2param":
+        caveat = ("3-parameter fit did not converge — using 2-parameter model, which may "
+                  "overestimate CP when short-duration anchors dominate.")
+    elif confidence == "low":
+        caveat = f"Low confidence: only {anchor_count} anchor(s), R²={r2_final:.2f}."
+
+    return {
+        "cp_watts":             round(cp_final),
+        "w_prime_kj":           round(w_prime_final / 1000, 1),
+        "k_constant":           round(k_final, 1) if k_final is not None else None,
+        "model_type":           model_type,
+        "r_squared":            round(r2_final, 3),
+        "anchor_count":         anchor_count,
+        "max_duration_used_s":  max_dur,
+        "anchors_only_short":   anchors_only_short,
+        "est_20min":            est_20min,
+        "est_60min":            est_60min,
+        "confidence":           confidence,
+        "caveat":               caveat,
+        "avg_anchor_likelihood": round(avg_anchor_likelihood, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
 # HR analysis for fatigue / fitness trends
 # ---------------------------------------------------------------------------
 
@@ -1529,6 +1906,117 @@ def _interpolate_power(dur_s, power_curve_data):
             else min(above, key=lambda x: x[0])[1])
 
 
+def compute_power_phenotype(curve_data):
+    """
+    Classify athlete type from power-duration curve using ratio-based analysis.
+
+    Two key ratios distinguish phenotype:
+    - P60/P300 (anaerobic index): how much stronger is 1-min vs 5-min?
+      > 1.25 = anaerobic/punch specialist; < 1.12 = aerobically oriented
+    - P600/P1200 (threshold flatness): how little does power drop from 10→20min?
+      > 0.94 = threshold specialist (very flat); < 0.90 = VO2max oriented (bigger drop)
+
+    Args:
+        curve_data: dict like {60: {"best": 400}, 300: {"best": 380}, ...}
+
+    Returns dict:
+        primary:                   "anaerobic" | "vo2max" | "threshold" | "all-rounder" | "unknown"
+        secondary:                 secondary phenotype string or None
+        best_kom_duration_range_s: [min_s, max_s]
+        best_kom_label:            human-readable KOM target recommendation
+        rationale:                 ratio breakdown string
+        cp_estimate:               CP estimated from 5-min and 20-min power (or None)
+        w_prime_kj:                W' estimated from CP model (or None)
+    """
+    p60   = (curve_data.get(60)   or {}).get("best")
+    p300  = (curve_data.get(300)  or {}).get("best")
+    p600  = (curve_data.get(600)  or {}).get("best")
+    p1200 = (curve_data.get(1200) or {}).get("best")
+
+    available = sum(1 for v in [p60, p300, p600, p1200] if v)
+    if available < 3:
+        return {
+            "primary": "unknown",
+            "secondary": None,
+            "best_kom_duration_range_s": [180, 480],
+            "best_kom_label": "VO2max climb (3-8min)",
+            "rationale": "Insufficient power data for phenotype classification.",
+            "cp_estimate": None,
+            "w_prime_kj": None,
+        }
+
+    # Ratio 1: anaerobic index — 1-min relative to 5-min
+    anaerobic_index = round(p60 / p300, 3) if p60 and p300 else None
+
+    # Ratio 2: threshold flatness — 20-min relative to 10-min (0→1; closer to 1 = flatter = threshold)
+    threshold_flatness = round(p1200 / p600, 3) if p600 and p1200 else None
+
+    # CP model from 5-min and 20-min (informational, not used for classification)
+    cp_est = None
+    w_prime_kj = None
+    if p300 and p1200:
+        cp_raw = (p300 * 300 - p1200 * 1200) / (300 - 1200)
+        cp_est = round(max(50, min(cp_raw, p300 * 0.98)))
+        w_prime_kj = round(max(0, (p300 - cp_est) * 300) / 1000, 1)
+
+    rationale_parts = []
+    if anaerobic_index:
+        rationale_parts.append(f"1-min/5-min ratio: {anaerobic_index:.2f}")
+    if threshold_flatness:
+        rationale_parts.append(f"20-min/10-min flatness: {threshold_flatness:.2f}")
+    if cp_est:
+        rationale_parts.append(f"CP≈{cp_est}w")
+    if w_prime_kj:
+        rationale_parts.append(f"W'≈{w_prime_kj}kJ")
+
+    # Classification: anaerobic index takes priority; threshold flatness breaks ties
+    secondary = None
+
+    if anaerobic_index is not None and anaerobic_index > 1.25:
+        # Strong 1-min vs 5-min: punch/sprint specialist
+        primary = "anaerobic"
+        range_s = [60, 180]
+        label = "punch/sprint climb (<3min)"
+        if threshold_flatness and threshold_flatness > 0.94:
+            secondary = "threshold"
+
+    elif anaerobic_index is not None and anaerobic_index > 1.18:
+        # Moderate anaerobic capacity: good at short-mid VO2max durations too
+        primary = "anaerobic"
+        range_s = [60, 300]
+        label = "punch or short VO2max climb (1-5min)"
+        secondary = "vo2max"
+
+    elif threshold_flatness is not None and threshold_flatness > 0.94:
+        # Very flat 10→20min curve: threshold specialist
+        primary = "threshold"
+        range_s = [480, 1200]
+        label = "threshold climb (8-20min)"
+        if anaerobic_index and anaerobic_index > 1.15:
+            secondary = "anaerobic"
+
+    elif threshold_flatness is not None and threshold_flatness < 0.92:
+        # Larger 10→20min drop (20-min is <92% of 10-min): VO2max phenotype
+        primary = "vo2max"
+        range_s = [180, 480]
+        label = "VO2max climb (3-8min)"
+
+    else:
+        primary = "all-rounder"
+        range_s = [180, 480]
+        label = "VO2max climb (3-8min) — balanced, prioritize achievability"
+
+    return {
+        "primary": primary,
+        "secondary": secondary,
+        "best_kom_duration_range_s": range_s,
+        "best_kom_label": label,
+        "rationale": " | ".join(rationale_parts) if rationale_parts else "Insufficient data.",
+        "cp_estimate": cp_est,
+        "w_prime_kj": w_prime_kj,
+    }
+
+
 def estimate_climb_time(distance_m, avg_grade_pct, power_curve_data, weight_kg=77):
     """
     Estimate David's time on an unridden climb using simplified climb physics.
@@ -1587,7 +2075,7 @@ def compute_power_metric(elapsed_time_s, avg_watts, kom_time_s,
     return None, None
 
 
-def _haversine_km(lat1, lng1, lat2, lng2):
+def haversine_km(lat1, lng1, lat2, lng2):
     """Approximate distance in km between two lat/lng points."""
     import math
     R = 6371
@@ -1619,7 +2107,7 @@ def build_segment_tracker(starred, ride_segments, fetch_leaderboard_fn, power_cu
         latlng = seg.get("start_latlng")
         if not latlng or len(latlng) < 2:
             return True  # no coords → assume local
-        return _haversine_km(home_lat, home_lng, latlng[0], latlng[1]) <= radius_km
+        return haversine_km(home_lat, home_lng, latlng[0], latlng[1]) <= radius_km
 
     starred_ids = {s["id"] for s in (starred or []) if _is_local(s)}
 

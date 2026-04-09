@@ -662,6 +662,58 @@ def _power_curve_card(power_curve_data, ftp_outdoor, curve_trend=None, is_recove
     </div>"""
 
 
+def _test_prescription_card(test_prescription):
+    """
+    Alert card rendered when Claude prescribes a fitness test.
+    test_prescription: dict with keys headline, instruction, trigger, urgency, format.
+    """
+    if not test_prescription:
+        return ""
+
+    headline = test_prescription.get("headline", "Fitness Test Needed")
+    instruction = test_prescription.get("instruction", "")
+    urgency = test_prescription.get("urgency", "this_week")
+    fmt = test_prescription.get("format", "")
+
+    format_labels = {
+        "ramp_test":     "Ramp Test (Peloton)",
+        "20min_tt":      "20-min TT",
+        "5min_efforts":  "5-min All-Out Efforts",
+        "max_climb":     "Max Climb Effort",
+    }
+    format_label = format_labels.get(fmt, fmt.replace("_", " ").title()) if fmt else ""
+    urgency_label = "This Week" if urgency == "this_week" else "Next Week"
+    urgency_color = RED if urgency == "this_week" else AMBER
+
+    format_badge = ""
+    if format_label:
+        format_badge = (f'<span style="display:inline-block;margin-left:8px;padding:2px 8px;'
+                        f'border-radius:4px;background:#fef3c7;color:#92400e;'
+                        f'font-size:10px;font-weight:700;">{format_label}</span>')
+
+    instruction_html = instruction.replace("\n", "<br>")
+
+    return f"""
+    <div style="background:#ffffff;border-radius:8px;border:2px solid {AMBER};
+                margin-bottom:16px;overflow:hidden;">
+      <div style="background:{AMBER};padding:10px 20px;display:flex;
+                  justify-content:space-between;align-items:center;">
+        <span style="color:#fff;font-size:11px;font-weight:700;
+                     text-transform:uppercase;letter-spacing:0.08em;">
+          ⚡ Fitness Test Prescription
+        </span>
+        <span style="background:{urgency_color};color:#fff;font-size:10px;font-weight:700;
+                     padding:2px 8px;border-radius:4px;">{urgency_label}</span>
+      </div>
+      <div style="padding:14px 20px;">
+        <p style="margin:0 0 6px;font-size:15px;font-weight:700;color:{SLATE};">
+          {headline}{format_badge}
+        </p>
+        <p style="margin:0;font-size:13px;color:#475569;line-height:1.65;">{instruction_html}</p>
+      </div>
+    </div>"""
+
+
 def _ef_hr_card(ef_data, interval_hr_data, rpe_signals):
     """
     Aerobic Efficiency + HR Response card.
@@ -1056,7 +1108,8 @@ def build_email(email_content, pmc_current, last_week_summary,
                 strava_descriptions=None, checkin_data=None,
                 segment_data=None,
                 ef_data=None, interval_hr_data=None, rpe_signals=None,
-                curve_trend=None, is_recovery_week=False):
+                curve_trend=None, is_recovery_week=False,
+                test_prescription=None):
     """
     Build full HTML email from Claude's email_content dict + PMC data.
     """
@@ -1140,6 +1193,7 @@ def build_email(email_content, pmc_current, last_week_summary,
         + _card("Last Week", recap.get("headline", ""), recap.get("body", ""), SLATE)
         + (_session_comparison_table(session_comparison, zone_ranges, ftp_outdoor, ftp_indoor)
            if session_comparison else "")
+        + (_test_prescription_card(test_prescription) if test_prescription else "")
         + _week_table(plan, zone_ranges=zone_ranges, ftp_outdoor=ftp_outdoor, ftp_indoor=ftp_indoor)
         + _card("Block Progress", progress.get("headline", ""), progress.get("body", ""), GREEN)
         + _card("Coach's Note", note.get("headline", ""), note.get("body", ""), PURPLE)
