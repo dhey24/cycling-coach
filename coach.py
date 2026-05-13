@@ -75,7 +75,13 @@ def _call_claude(system_prompt, user_prompt):
                 system=system_prompt,
                 messages=[{"role": "user", "content": user_prompt}],
             )
-            return msg.content[0].text
+            stop_reason = msg.stop_reason
+            text = msg.content[0].text if msg.content else ""
+            if stop_reason == "max_tokens":
+                print(f"WARNING: Claude response truncated at max_tokens={MAX_TOKENS} (stop_reason=max_tokens). Response may be incomplete.")
+            if not text:
+                print(f"WARNING: Claude returned empty text (stop_reason={stop_reason}, content blocks={len(msg.content)})")
+            return text
         except Exception as e:
             last_err = e
             if attempt < RETRIES:
@@ -105,7 +111,7 @@ Output only valid JSON — no commentary before or after.
 **Tempo/sweet spot duration progression**: Continuous tempo (75–90% FTP) duration must not increase by more than 15 min relative to the athlete's established maximum in a single session step. If the athlete's current max continuous Z3 is ~12 min, appropriate first steps are 20 min, then 30 min over multiple sessions — not a jump to 60–70 min. Continuous tempo >60 min is appropriate only for athletes with CTL 80+."""
 
 BLOCK_USER_TEMPLATE = """
-Generate a 5-week training block for this athlete. Today is {today}.
+Generate a 5-week training block for this athlete (extendable to 6-7 weeks if compliance is strong and adaptation is continuing — see athlete preferences). Today is {today}.
 
 ## Athlete Profile
 {preferences}
@@ -126,7 +132,7 @@ Return a JSON object exactly matching this schema:
     "goal": "One sentence: the primary physiological adaptation this block targets",
     "structure": "Weeks 1-2: base build, Week 3: peak intensity, Week 4: recovery, Week 5: specific",
     "key_sessions": ["Tuesday/Thursday VO2max 5x4min Z5", "Sunday long Z2 90min"],
-    "tss_progression": [280, 320, 350, 210, 340],
+    "tss_progression": [200, 230, 260, 160, 280],
     "physiological_rationale": "2-3 sentences explaining the science behind this block structure"
   }},
   "weeks": [
@@ -139,7 +145,7 @@ Return a JSON object exactly matching this schema:
       "sessions": [
         {{
           "day": "monday",
-          "type": "rest|z2|tempo|sweet_spot|vo2max|anaerobic|race",
+          "type": "rest|z2|tempo|sweet_spot|threshold|vo2max|anaerobic|race",
           "duration_min": 60,
           "zone_label": "Z2",
           "target_watts": 225,
@@ -169,7 +175,7 @@ Session rules:
 - Never back-to-back hard sessions across the Sat/Sun boundary if Saturday is riding
 - Week 4 or 5 must be a recovery week (TSS drop ~40%)
 - `interval_minutes`: REQUIRED for all non-rest sessions. List of ints, each the duration in minutes of one named segment (warmup, each work rep, each recovery, cooldown). MUST sum exactly to `duration_min`. Verify your arithmetic before outputting.
-- `interval_sets`: REQUIRED for vo2max/anaerobic/sweet_spot/tempo sessions. Never omit. List every set with count, duration_s (seconds per rep), target_watts, and rest_s (recovery between reps). List each set separately if intensity or duration differs. Example: [{{"count": 5, "duration_s": 240, "target_watts": 382, "rest_s": 240}}]. Omit only for z2/z1/rest.
+- `interval_sets`: REQUIRED for vo2max/anaerobic/sweet_spot/tempo/threshold sessions. Never omit. List every set with count, duration_s (seconds per rep), target_watts, and rest_s (recovery between reps). List each set separately if intensity or duration differs. Example: [{{"count": 5, "duration_s": 240, "target_watts": 382, "rest_s": 240}}]. Omit only for z2/z1/rest.
 - `warmup_min`: REQUIRED for z2/z1 sessions. Integer number of planned warmup minutes.
 - `cooldown_min`: REQUIRED for z2/z1 sessions. Integer number of planned cooldown minutes.
 
@@ -189,6 +195,7 @@ Description format (REQUIRED):
 
 Session type targets:
 - VO2max: 4-6x4min @ Z5 (110-120% FTP) or 8-12x1min @ Z6 (130%+ FTP) with equal rest
+- Threshold: 3x10min or 2x15min @ 95-105% FTP (Z4) with 3-5min recovery — directly targets the athlete's 5-min→20-min gap. Alternate with VO2max as the second weekly hard session.
 - Z2: 55-75% FTP, steady — the aerobic base
 - Anaerobic: 6-10x30s-90s @ Z6-Z7 with 3-5x rest
 - KOM target efforts: anaerobic/VO2 blend — train both systems 2x/week
@@ -260,7 +267,16 @@ Inspect the LAST DAY ACTUALLY RIDDEN in last week's session_comparison. If it wa
 
 **Tempo/sweet spot duration progression**: Continuous tempo (75–90% FTP) duration must not increase by more than 15 min relative to the athlete's established maximum in a single session step. If the athlete's current max continuous Z3 is ~12 min, appropriate first steps are 20 min, then 30 min over multiple sessions — not a jump to 60–70 min. Continuous tempo >60 min is appropriate only for athletes with CTL 80+.
 
-**Fitness test prescription**: When the FITNESS TEST TRIGGERS section in the user prompt reports stale power curve data (>6 weeks without a max effort at a key duration) or a sustained ATL drop (>30% for >10 days), you MUST set `test_prescription` in your output. The prescription must be specific — name the format, venue/segment if applicable, and which day this week or next to target. Do NOT prescribe a test in recovery weeks or when TSB < -15. If no triggers are active, set `test_prescription` to null."""
+**Fitness test prescription**: When the FITNESS TEST TRIGGERS section in the user prompt reports stale power curve data (>6 weeks without a max effort at a key duration) or a sustained ATL drop (>30% for >10 days), you MUST set `test_prescription` in your output. The prescription must be specific — name the format, venue/segment if applicable, and which day this week or next to target.
+
+**Test placement rules (hard constraints — do not override):**
+- Do NOT prescribe a 20-min FTP TT or short anchor test mid-build. These tests belong in Week 1 of a new block, after the recovery week that closes the current block. The recovery week IS the taper.
+- Do NOT prescribe any max effort test when TSB < 0. TSB must be ≥ 0 on test day; +5 to +15 is ideal. A test at negative TSB underestimates fitness and miscalibrates all subsequent interval targets.
+- No hard sessions in the 4 days before any max test. One rest day is never sufficient.
+- Exception for ATL drop >30% (illness/break): prescribe a ramp test only (not a 20-min TT) — ramp tests are more robust to residual fatigue.
+- If stale triggers are active but TSB is negative: set `urgency: next_week` and note that freshness is required first. Do not push the test into the current fatigued week.
+
+If no triggers are active, set `test_prescription` to null."""
 
 WEEKLY_USER_TEMPLATE = """
 Today is {today} (Monday). Generate this week's coaching report and update the training block.
@@ -339,11 +355,21 @@ When interpreting feedback, apply these rules in order:
 ## Current Training Block
 {plan_json}
 
+## Block Arc (REQUIRED to use if present)
+The plan above may include `block_overview` (typed `primary_goal` + `secondary_goals`), `block_arc` (per-week milestones), and per-week `coaching_context`. When present, these are the source of truth for what each week is supposed to achieve. Process them as follows:
+
+1. **Update last week's arc entry**: in `updated_plan.block_arc`, find the entry whose `week` matches the week that just ended. Set its `status` to one of `DONE` | `DONE_INFORMAL` | `PARTIAL` | `MISSED` and write a one-sentence `result` referencing actual numbers (watts hit, sessions completed, key data points).
+2. **Validate this week's prescription against `block_arc[this_week].metric`**: every session you generate for this week must serve that milestone. If a session doesn't, drop or replace it.
+3. **`coaching_context` overrides `theme`**: if `weeks[this_week].coaching_context` exists, treat it as the primary brief for the week. The short `theme` is just a label.
+4. **Revise the arc when reality changes**: if actuals reveal the arc is no longer realistic (e.g., a fitness test resolves indoor FTP much lower than expected, or athlete misses a key milestone), edit `block_arc[future_weeks]` with one-line updates to milestone/metric and explain in `coaches_note`.
+5. **Preserve all new fields in `updated_plan`**: never drop `block_overview`, `block_arc`, or `coaching_context` from the output. They must round-trip.
+6. **`updated_plan.weeks[]` MUST contain ALL 5 weeks of the block** with at minimum these fields per week: `week_number`, `week_of`, `week_start`, `theme`, `planned_tss`, `coaching_context`. Past weeks (week 1 if it ran, prior weeks in later runs) MUST preserve their `sessions[]` arrays exactly as in the input. Future weeks may have empty `sessions: []`. Never return `weeks: []`. Never drop a week.
+
 ## Output Format
 Return a JSON object exactly matching this schema:
 
 {{
-  "updated_plan": {{ <same schema as input plan, with remaining weeks adjusted based on actuals> }},
+  "updated_plan": {{ <same schema as input plan, with remaining weeks adjusted based on actuals; preserve and update block_overview, block_arc, and per-week coaching_context if present in input> }},
   "email": {{
     "fitness_snapshot": {{
       "headline": "CTL {ctl} / ATL {atl} / TSB {tsb}",
@@ -390,17 +416,21 @@ Return a JSON object exactly matching this schema:
 
 `test_prescription` rules:
 - Set to null if NO fitness test trigger is active (the normal case).
-- Set to an object only when one or more trigger conditions are present in FITNESS TEST TRIGGERS:
-  - Stale 20-min data (>6 weeks): prescribe a 20-min all-out TT or max climb (match athlete's stated preference from preferences.md).
-  - Stale 5-min data (>6 weeks): prescribe 2x all-out 5-min efforts with full recovery.
-  - ATL drop >30% for >10 days: prescribe a ramp test (safest when fatigued) to re-anchor fitness before building load.
-  - If both stale durations are triggered, address both in one prescription.
-- When prescribing, be SPECIFIC: name the format, the segment/venue if known from preferences.md (Pantoll for 20-min climbs), and why we need it.
+- Set to an object only when one or more trigger conditions are present in FITNESS TEST TRIGGERS AND the freshness gate passes (TSB ≥ 0):
+  - Stale 20-min data (>6 weeks): prescribe a 20-min all-out TT or max climb (match athlete's stated preference from preferences.md). ONLY valid in block Week 1 (after recovery week). If mid-block, set urgency: next_week and note "defer to block Week 1 — requires recovery week taper first."
+  - Stale 5-min data (>6 weeks): prescribe 2x all-out 5-min efforts with full recovery. Valid in block Week 1 or if TSB ≥ 0 and no hard sessions in prior 4 days.
+  - Stale 3-min data (>4 weeks): prescribe 2x all-out 3-min efforts with full recovery (Twin Peaks / 29th St area, start of ride). Same freshness gate as 5-min.
+  - Stale 2-min data (>4 weeks): prescribe 1x all-out 2-min effort (can combine with 3-min and 5-min test day). Same freshness gate.
+  - ATL drop >30% for >10 days: prescribe a ramp test ONLY (not 20-min TT) — ramp tests are more robust to residual fatigue.
+  - If multiple durations are triggered, combine into one test day: 5-min first, 10min easy, 3-min, 6min easy, 2-min. All at start of ride.
+  - Per-block testing protocol (from preferences.md): always prescribe a short anchor test (5-min + 3-min) in block week 1 regardless of staleness triggers.
+  - If triggers are active but TSB < 0: set urgency: next_week and note that the test must wait for freshness. Never push a max test into a fatigued week.
+- When prescribing, be SPECIFIC: name the format, the segment/venue if known from preferences.md (Pantoll for 20-min climbs, Twin Peaks / 29th St for short anchors), and why we need it.
 - Schema when active:
   {{
-    "trigger": "stale_20min|stale_5min|stale_both|atl_drop",
+    "trigger": "stale_20min|stale_5min|stale_3min|stale_2min|stale_multi|atl_drop|block_week1",
     "urgency": "this_week|next_week",
-    "format": "ramp_test|20min_tt|5min_efforts|max_climb",
+    "format": "ramp_test|20min_tt|5min_efforts|3min_efforts|short_anchor_test|max_climb",
     "headline": "short punchy headline (e.g. 'Time to test — FTP anchor needed')",
     "instruction": "Specific, direct instruction. Include venue/segment name, how many reps, when in the week."
   }}
@@ -412,7 +442,7 @@ Session rules (same as block generation):
 - Use zone_label (Z1–Z7) and target_watts_range from correct FTP table (indoor vs outdoor)
 - Description: always bullet format "• Warmup: ...\\n• Main: ...\\n• Cooldown: ...\\n• Focus: ..."
 - `interval_minutes`: REQUIRED for all non-rest sessions. List of ints, each the duration in minutes of one named segment (warmup, each work rep, each recovery, cooldown). MUST sum exactly to `duration_min`. Verify your arithmetic before outputting.
-- `interval_sets`: REQUIRED for vo2max/anaerobic/sweet_spot/tempo sessions. Never omit. List every set with count, duration_s (seconds per rep), target_watts, and rest_s (recovery between reps). List each set separately if intensity or duration differs. Example: [{{"count": 5, "duration_s": 240, "target_watts": 382, "rest_s": 240}}]. Omit only for z2/z1/rest.
+- `interval_sets`: REQUIRED for vo2max/anaerobic/sweet_spot/tempo/threshold sessions. Never omit. List every set with count, duration_s (seconds per rep), target_watts, and rest_s (recovery between reps). List each set separately if intensity or duration differs. Example: [{{"count": 5, "duration_s": 240, "target_watts": 382, "rest_s": 240}}]. Omit only for z2/z1/rest.
 - `warmup_min`: REQUIRED for z2/z1 sessions. Integer number of planned warmup minutes.
 - `cooldown_min`: REQUIRED for z2/z1 sessions. Integer number of planned cooldown minutes.
 
@@ -473,7 +503,9 @@ def generate_weekly_email(pmc_current, last_week_actual, last_week_planned_tss,
                           compliance_history=None, segment_data=None,
                           ef_data=None, interval_hr_data=None, rpe_signals=None,
                           phenotype_data=None, yoy_data=None,
-                          fitness_test_triggers=None, cp_model_data=None):
+                          fitness_test_triggers=None, cp_model_data=None,
+                          cp_trend_data=None, hr_at_vo2max_data=None,
+                          hr_drift_inference=None, indoor_ftp_estimate=None):
     """
     Generate weekly coaching email + update plan.
     Returns email content dict.
@@ -613,6 +645,41 @@ def generate_weekly_email(pmc_current, last_week_actual, last_week_planned_tss,
             plateau_note = ("reaching maximal effort" if plateau >= 92
                             else "not reaching max HR — conservative pacing or fatigue")
             ef_hr_lines.append(f"  HR plateau during intervals: {plateau}% of max — {plateau_note}")
+
+    # CP trend (week-by-week model estimates)
+    if cp_trend_data and len(cp_trend_data) >= 2:
+        pts = [(r["week_end"][5:], r["cp_watts"]) for r in cp_trend_data if r.get("cp_watts")]
+        if len(pts) >= 2:
+            trend_str = " → ".join(f"{w}w ({d})" for d, w in pts[-4:])
+            ef_hr_lines.append(f"  CP model trend (last {len(pts)} weeks): {trend_str}")
+
+    # HR at fixed VO2max power (aerobic adaptation signal)
+    if hr_at_vo2max_data and len(hr_at_vo2max_data) >= 2:
+        avg_w = hr_at_vo2max_data[0].get("avg_watts") or "?"
+        pts = hr_at_vo2max_data[-4:]
+        hr_str = " → ".join(
+            f"{r['avg_peak_hr']:.0f} BPM ({r['week_end'][5:]}, n={r['interval_count']})"
+            for r in pts
+        )
+        ef_hr_lines.append(f"  HR at {avg_w}w (VO2max power): {hr_str}")
+
+    # HR-drift CP inference
+    if hr_drift_inference and hr_drift_inference.get("confidence") != "low":
+        ef_hr_lines.append(
+            f"  HR-drift CP inference: {hr_drift_inference['note']} → "
+            f"implied CP change ~{hr_drift_inference['cp_change_w']:+.0f}w "
+            f"({hr_drift_inference['confidence']} confidence)"
+        )
+
+    # Indoor FTP estimate
+    if indoor_ftp_estimate:
+        ftp_rw = indoor_ftp_estimate["ftp_raw_w"]
+        ftp_tw = indoor_ftp_estimate["ftp_true_w"]
+        ef_hr_lines.append(
+            f"  Indoor FTP inference: {ftp_rw}w raw (= {ftp_tw}w outdoor-equiv via 1.18× device factor). "
+            f"{indoor_ftp_estimate['note']}. "
+            f"Prescribe Peloton FTP retest in new block if working estimate differs from test value by >8w."
+        )
 
     ef_hr_signals_str = "\n".join(ef_hr_lines) if ef_hr_lines else "  No EF/HR stream data yet."
 
@@ -1211,6 +1278,9 @@ NEW_BLOCK_USER_TEMPLATE = """
 Generate a new 5-week training block. Today is {today}. This is a BLOCK TRANSITION — not the first run.
 Use the prior block data to inform the next block type, TSS ramp, and power targets.
 
+## Season Position
+{season_position}
+
 ## Athlete Profile
 {preferences}
 
@@ -1221,6 +1291,9 @@ Use the prior block data to inform the next block type, TSS ramp, and power targ
 
 ## Fitness Reassessment
 {fitness_assessment}
+
+## Training-Derived Inference Signals (block-end)
+{inference_section}
 
 ## Prior Block Summary
 {block_summary}
@@ -1259,17 +1332,24 @@ Session rules (same as always):
 - Saturday is OPTIONAL — include if week needs volume. Mark optional: true
 - Never back-to-back hard sessions
 - Week 4 or 5 must be a recovery week (TSS drop ~40%)
+- **FTP TT and short anchor tests go in Week 1 ONLY.** The recovery week that closes this block is the taper. Do not place any max effort test in build weeks 2–5. Week 1 sessions must be structured so TSB ≥ 0 by test day (no hard sessions in the 4 days before the test).
 - `interval_minutes` MUST sum exactly to `duration_min`
 """
 
 
 def generate_new_block(pmc_current, ctl_block_start, block_summary_str,
-                       debrief, fitness_assessment, block_history_str=""):
+                       debrief, fitness_assessment, block_history_str="",
+                       block_sequence=None,
+                       ef_data=None, cp_model_data=None,
+                       cp_trend_data=None, hr_at_vo2max_data=None,
+                       hr_drift_inference=None, indoor_ftp_estimate=None):
     """
     Generate the next 5-week block at a block transition.
     Richer context than generate_block() (init): includes debrief, fitness evidence,
     prior block summary, and CTL delta over the block.
+    block_sequence: (block_number_this_year, total_all_time) tuple from db.get_block_sequence()
     """
+    import db as db_module
     prefs = _load_preferences()
     today = date.today().isoformat()
 
@@ -1277,6 +1357,18 @@ def generate_new_block(pmc_current, ctl_block_start, block_summary_str,
     atl = pmc_current.get("atl", 0)
     tsb = pmc_current.get("tsb", 0)
     ctl_delta = ctl - (ctl_block_start or ctl)
+
+    if block_sequence is None:
+        try:
+            block_sequence = db_module.get_block_sequence()
+        except Exception:
+            block_sequence = (1, 1)
+    block_num_year, block_total = block_sequence
+    year = date.today().year
+    season_position = (
+        f"This is block {block_num_year} of {year} ({block_total} blocks total recorded). "
+        f"Use this to calibrate season arc (base → build → peak → competition → recovery)."
+    )
 
     # Format debrief section
     d = debrief or {}
@@ -1294,8 +1386,62 @@ def generate_new_block(pmc_current, ctl_block_start, block_summary_str,
 
     history_section = f"## PRIOR BLOCK HISTORY\n{block_history_str}" if block_history_str else ""
 
+    # Build inference section for block generation
+    inference_lines = []
+    if ef_data and ef_data.get("ef_recent"):
+        trend_str = (f"{'+' if (ef_data.get('ef_trend_pct') or 0) >= 0 else ''}"
+                     f"{ef_data['ef_trend_pct']}%"
+                     if ef_data.get("ef_trend_pct") is not None else "—")
+        inference_lines.append(
+            f"EF (aerobic efficiency): {ef_data['ef_recent']:.3f} ({trend_str} vs prior 4wk)"
+        )
+        if ef_data.get("avg_decoupling") is not None:
+            inference_lines.append(f"Avg aerobic decoupling: {ef_data['avg_decoupling']:.1f}%")
+    if cp_trend_data:
+        pts = [(r["week_end"][5:], r["cp_watts"]) for r in cp_trend_data if r.get("cp_watts")]
+        if pts:
+            inference_lines.append(
+                "CP model trend (last {} weeks): {}".format(
+                    len(pts),
+                    " → ".join(f"{w}w ({d})" for d, w in pts[-4:])
+                )
+            )
+    if hr_at_vo2max_data and len(hr_at_vo2max_data) >= 2:
+        avg_w = hr_at_vo2max_data[0].get("avg_watts") or "?"
+        pts = hr_at_vo2max_data[-4:]
+        hr_str = " → ".join(
+            f"{r['avg_peak_hr']:.0f} BPM ({r['week_end'][5:]}, n={r['interval_count']})"
+            for r in pts
+        )
+        inference_lines.append(f"HR at {avg_w}w (VO2max power): {hr_str}")
+    if hr_drift_inference and hr_drift_inference.get("confidence") != "low":
+        inference_lines.append(
+            f"HR-drift CP inference: {hr_drift_inference['note']} → "
+            f"implied CP change ~{hr_drift_inference['cp_change_w']:+.0f}w "
+            f"({hr_drift_inference['confidence']} confidence)"
+        )
+    if indoor_ftp_estimate:
+        inference_lines.append(
+            f"Indoor FTP inference: {indoor_ftp_estimate['ftp_raw_w']}w raw "
+            f"(= {indoor_ftp_estimate['ftp_true_w']}w outdoor-equiv). "
+            f"{indoor_ftp_estimate['note']}"
+        )
+
+    if inference_lines:
+        inference_section = "\n".join(f"- {l}" for l in inference_lines)
+        inference_section += (
+            "\n\nCoach instruction: Use these inference signals to calibrate block starting "
+            "intensity targets. If HR-drift implies CP has risen, bump sweet spot and VO2max "
+            "targets accordingly without waiting for a formal test (if confidence ≥ medium). "
+            "If indoor FTP estimate differs from the test value by >8w, prescribe a Peloton "
+            "FTP retest in week 1."
+        )
+    else:
+        inference_section = "  Insufficient training-derived inference data (< 2 weeks of VO2max intervals)."
+
     user_prompt = NEW_BLOCK_USER_TEMPLATE.format(
         today=today,
+        season_position=season_position,
         preferences=prefs,
         ctl=ctl,
         ctl_block_start=ctl_block_start or ctl,
@@ -1306,6 +1452,7 @@ def generate_new_block(pmc_current, ctl_block_start, block_summary_str,
         block_summary=block_summary_str or "  No block summary available.",
         debrief_section=debrief_section,
         history_section=history_section,
+        inference_section=inference_section,
     )
 
     print("Generating new training block with Claude (block transition)...")
@@ -1324,6 +1471,9 @@ Output only valid JSON — no commentary before or after."""
 
 TRANSITION_EMAIL_TEMPLATE = """
 Today is {today}. Write the block transition coaching email.
+
+## Season Position
+{season_position}
 
 ## Athlete Profile
 {preferences}
@@ -1348,10 +1498,24 @@ Today is {today}. Write the block transition coaching email.
 ## Output Format
 Return a JSON object:
 {{
+  "block_story": {{
+    "headline": "Block [N] recap: [one-line verdict]",
+    "body": "2-3 sentences narrating the arc of the block: what the goal was, what
+             actually happened (compliance, key sessions hit or missed, any disruptions),
+             and a direct verdict on whether the block delivered. Reference specific
+             metrics (CTL delta, compliance %, power changes). No fluff."
+  }},
+  "season_arc": {{
+    "headline": "Season position: [phase description]",
+    "body": "1-2 sentences placing this block in the season. E.g. 'Block 2 of the 2026
+             build phase, transitioning from base fitness to structured interval work.'
+             Name what comes next and why."
+  }},
   "block_scorecard": {{
     "headline": "short verdict on the completed block",
     "body": "2-3 sentences: what the block achieved, compliance summary, CTL gained.
-             Be direct — did the block work?"
+             Be direct — did the block work? Include one sentence comparing to the
+             prior block if prior block data is available."
   }},
   "power_curve_summary": {{
     "headline": "Power curve: X changes",
@@ -1378,25 +1542,45 @@ Return a JSON object:
 
 def generate_block_transition_email(pmc_current, ctl_block_start,
                                     block_summary_str, debrief,
-                                    fitness_assessment, new_plan):
+                                    fitness_assessment, new_plan,
+                                    block_sequence=None):
     """
     Generate the block transition email content (separate from weekly email).
     Returns the email content dict.
+    block_sequence: (block_number_this_year, total_all_time) tuple from db.get_block_sequence()
     """
+    import db as db_module
     prefs = _load_preferences()
     today = date.today().isoformat()
 
+    if block_sequence is None:
+        try:
+            block_sequence = db_module.get_block_sequence()
+        except Exception:
+            block_sequence = (1, 1)
+    block_num_year, block_total = block_sequence
+    year = date.today().year
+    plan_phase = (new_plan or {}).get("phase", "build")
+    season_position = (
+        f"Block {block_num_year} of {year} ({block_total} blocks total across all time). "
+        f"Incoming phase: {plan_phase}."
+    )
+
     d = debrief or {}
     debrief_lines = [
-        f"  Goal achieved:   {d.get('goal_achieved_label', '—')}",
-        f"  Biggest limiter: {d.get('biggest_limiter') or 'None reported'}",
-        f"  Motivation:      {d.get('motivation_label', '—')}",
-        f"  Injuries:        {d.get('injuries') or 'None'}",
-        f"  Disruptions:     {d.get('disruptions') or 'None'}",
+        f"  Goal achieved:          {d.get('goal_achieved_label', '—')}",
+        f"  Biggest limiter:        {d.get('biggest_limiter') or 'None reported'}",
+        f"  Motivation:             {d.get('motivation_label', '—')}",
+        f"  Injuries/concerns:      {d.get('injuries') or 'None'}",
+        f"  Disruptions this block: {d.get('disruptions') or 'None'}",
+        f"  Goal shifted:           {'Yes — ' + d.get('goal_description', '') if d.get('goal_shifted') else 'No'}",
+        f"  Availability changed:   {'Yes — ' + d.get('availability_description', '') if d.get('availability_changed') else 'No'}",
+        f"  Test preference:        {d.get('test_preference_label', '—')}",
     ]
 
     user_prompt = TRANSITION_EMAIL_TEMPLATE.format(
         today=today,
+        season_position=season_position,
         preferences=prefs,
         block_summary=block_summary_str or "  No block summary available.",
         fitness_assessment=fitness_assessment.get("evidence_summary", "No evidence data."),

@@ -46,6 +46,12 @@ python fill_leaderboards.py         # Background leaderboard cache warming (30mi
 python fill_hr_streams.py           # Bulk HR stream backfill
 python replan.py                    # Mid-week adaptive replan (run after a bad session)
 python replan.py --dry-run          # Preview replan without saving
+python match_audit.py               # Planned vs actual session matching audit (last 4 weeks)
+python match_audit.py --weeks=8     # Longer lookback
+python match_audit.py --label       # Interactive: assign activity IDs to unmatched sessions
+python training_history.py          # Multi-year training analysis report (HTML + charts + coach interpretation)
+python training_history.py --no-coach  # Skip Claude coaching interpretation
+python training_history.py --from=2022 # Override start year
 ```
 
 ---
@@ -67,6 +73,8 @@ python replan.py --dry-run          # Preview replan without saving
 | `replan.py` | Mid-week adaptive replan: reads completed-session power actuals + Strava descriptions → Claude adjusts remaining days with dampening rules |
 | `kom_scout.py` | Segment ranking + KOM opportunity HTML report; badges segments by phenotype match |
 | `segment_similarity.py` | Nearest-neighbor similarity search: surfaces segments matching David's proven top-10 profile using standardized euclidean distance on [grade, log(duration), log(athletes)] |
+| `match_audit.py` | Planned vs actual session matching audit + interactive labeling; loads archived plans from `data/plans/` |
+| `training_history.py` | Multi-year training analysis: 8 charts + HTML report + Claude coaching interpretation + markdown summary |
 | `preferences.md` | **Source of truth for athlete config** — FTP, zones, HR, goals, home lat/lng |
 
 ---
@@ -122,6 +130,7 @@ Non-critical steps (DB writes, HR analysis, power curves, segments) are wrapped 
 | `.cache/detail_{id}.json` | Activity detail: `description`, `segment_efforts`, `laps` | `strava_client.py` |
 | `.cache/seg_stats_{id}.json` | Segment leaderboard data | `fill_leaderboards.py` |
 | `preferences.md` | **Athlete config** (FTP, zones, goals, home lat/lng) | Human + `calibrate_targets.py` |
+| `data/match_overrides.json` | Manual session→ride pairings that bypass the matching algorithm | `match_audit.py --label` or hand-edited |
 
 ---
 
@@ -130,7 +139,7 @@ Non-critical steps (DB writes, HR analysis, power curves, segments) are wrapped 
 | Table | Purpose | Key Columns |
 |-------|---------|-------------|
 | `pmc_daily` | CTL/ATL/TSB history (full history — not rolling window) | `date` (PK), `tss`, `ctl`, `atl`, `tsb` |
-| `session_compliance` | Planned vs actual per session | `week_start`, `day`, `status` (HIT/PARTIAL/MISS) |
+| `session_compliance` | Planned vs actual per session | `week_start`, `day`, `status` (HIT/PARTIAL/MISS), `activity_id` (Strava ID of matched ride) |
 | `power_curve_weekly` | Best efforts per week | `week_end` (PK), `s60`, `s300`, `s600`, `s1200` (watts) |
 | `segment_efforts` | KOM segment attempts | `date`, `segment_id`, `avg_watts`, `rank`, `tier` |
 | `segment_history` | Full segment ride log | `activity_id`, `segment_id`, `avg_watts` |
@@ -179,10 +188,23 @@ Logs: `~/Library/Logs/cycling-coach/`
 
 ---
 
+## Block Planning Rules — Testing
+
+Max effort tests (FTP TT, 5-min anchor, 3-min anchor) have hard placement constraints. The coach prompt in `coach.py` must enforce these when generating or modifying plans:
+
+1. **Tests go in Week 1 of a new block, not mid-build.** The recovery week that closes the prior block is the taper. Placing a test mid-build (e.g., Week 3–4 of an active block) produces a fatigued number that miscalibrates targets for the rest of the block.
+2. **TSB must be ≥ 0 on test day, ideally +5 to +15.** If the computed TSB at the scheduled test day is negative, move the test or extend the recovery week.
+3. **No hard sessions in the 4 days before any max test.** One rest day is insufficient. This is a structural rule, not an athlete-feel heuristic.
+4. **The recovery week IS the taper.** Design the prior block's final week(s) so that TSB is positive by the time the test arrives — not by adding rest days mid-build.
+
+Full freshness requirements and the test-week structure template are in `preferences.md` → *Power Testing Protocol*.
+
+---
+
 ## Plan Session Schema (required fields)
 
 Every non-rest session in `plan.json` must have:
-- `interval_sets`: **required** for `vo2max`, `anaerobic`, `sweet_spot`, `tempo` — list of `{count, duration_s, target_watts, rest_s}` per set; enables per-effort target matching
+- `interval_sets`: **required** for `vo2max`, `anaerobic`, `sweet_spot`, `tempo`, `threshold` — list of `{count, duration_s, target_watts, rest_s}` per set; enables per-effort target matching
 - `warmup_min`, `cooldown_min`: **required** for `z2`, `z1` — used as fallback if dynamic Z2 detection fails
 - `interval_minutes`: required for all non-rest sessions — must sum to `duration_min`
 
