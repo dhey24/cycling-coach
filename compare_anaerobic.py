@@ -417,7 +417,7 @@ def print_coaching_analysis(sess_a, sess_b):
     print()
 
 
-INTENSITY_TYPES = {"vo2max", "anaerobic", "sweet_spot", "tempo"}
+INTENSITY_TYPES = {"vo2max", "anaerobic", "sweet_spot", "tempo", "threshold"}
 
 
 def collect_intensity_sessions(plan, activities, ftp_outdoor, ftp_indoor, week_offsets):
@@ -587,7 +587,7 @@ def main():
     print("\nRefreshing Strava token + fetching activities...")
     strava_client.refresh_access_token()
     activities = strava_client.fetch_activities(weeks=4, force_refresh=True)
-    ftp_outdoor, ftp_indoor = metrics.load_ftps()
+    ftp_outdoor, ftp_indoor, *_ = metrics.load_ftps()
     plan = load_plan()
 
     print(f"FTPs: outdoor={ftp_outdoor}w  indoor={ftp_indoor}w")

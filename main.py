@@ -99,14 +99,20 @@ def get_planned_tss(plan, week_offset=1):
     if not plan or "weeks" not in plan:
         return 0
     today = date.today()
+    target_monday = today - timedelta(days=today.weekday()) - timedelta(weeks=week_offset)
+    best_week, best_delta = None, float("inf")
     for week in plan["weeks"]:
         try:
-            week_start = date.fromisoformat(week["week_start"])
-            if (today - week_start).days <= 13:  # rough match for last week
-                return week.get("target_tss", 0)
+            ws = date.fromisoformat(week["week_start"])
+            delta = abs((ws - target_monday).days)
+            if delta <= 3 and delta < best_delta:
+                best_delta = delta
+                best_week = week
         except Exception:
             continue
-    return plan["weeks"][0].get("target_tss", 0) if plan["weeks"] else 0
+    if best_week:
+        return best_week.get("planned_tss") or best_week.get("target_tss") or 0
+    return 0
 
 
 def run(init_mode=False, dry_run=False):
@@ -118,24 +124,45 @@ def run(init_mode=False, dry_run=False):
     activities = strava_client.fetch_activities(weeks=8, force_refresh=force)
 
     # 3. Compute core metrics
-    ftp_outdoor, ftp_indoor = metrics.load_ftps()
+    ftp_outdoor, ftp_indoor, ftp_indoor_working, peloton_factor = metrics.load_ftps()
     zone_ranges = metrics.compute_zone_ranges(ftp_outdoor, ftp_indoor)
     tss_by_day  = metrics.daily_tss(activities, ftp_outdoor, ftp_indoor, weeks=8)
-    pmc_series  = metrics.compute_pmc(tss_by_day)
+    # Seed PMC from DB so CTL is continuous across runs (not restarted from 0 each week)
+    _window_start = date.today() - timedelta(weeks=8)
+    _pmc_seed     = db_module.get_pmc_seed(before_date=_window_start)
+    if _pmc_seed["ctl"] > 0:
+        print(f"PMC seed: CTL={_pmc_seed['ctl']:.1f} / ATL={_pmc_seed['atl']:.1f} (from DB history)")
+    pmc_series  = metrics.compute_pmc(tss_by_day,
+                                       ctl_seed=_pmc_seed["ctl"],
+                                       atl_seed=_pmc_seed["atl"])
     pmc_current = metrics.current_pmc(pmc_series)
+
+    # Weekly PMC snapshots for sparklines (last 13 Sundays, oldest first)
+    _pmc_by_date = {row["date"]: row for row in pmc_series}
+    _today = date.today()
+    pmc_history = []
+    for w in range(12, -1, -1):
+        sunday = _today - timedelta(days=_today.weekday()) + timedelta(days=6) - timedelta(weeks=w)
+        row = _pmc_by_date.get(sunday)
+        if row:
+            pmc_history.append({"ctl": row["ctl"], "tss": row["tss"]})
 
     last_week = metrics.weekly_summary(activities, ftp_outdoor, ftp_indoor, week_offset=1)
     this_week = metrics.weekly_summary(activities, ftp_outdoor, ftp_indoor, week_offset=0)
 
     # 4. HR analysis
-    hr_data = metrics.hr_analysis(activities, weeks=4, ftp_outdoor=ftp_outdoor, ftp_indoor=ftp_indoor)
+    hr_data = metrics.hr_analysis(activities, weeks=4, ftp_outdoor=ftp_outdoor,
+                                   ftp_indoor=ftp_indoor, peloton_factor=peloton_factor)
 
     # 4e. Write PMC to DuckDB (non-fatal — DB is enhancement, not critical path)
-    try:
-        db_module.append_pmc_rows(pmc_series)
-        print("DB: PMC written.")
-    except Exception as e:
-        print(f"DB write failed (non-fatal): {e}")
+    if not dry_run:
+        try:
+            db_module.append_pmc_rows(pmc_series)
+            print("DB: PMC written.")
+        except Exception as e:
+            print(f"DB write failed (non-fatal): {e}")
+    else:
+        print("DB: PMC write skipped (dry-run — would corrupt history with stale cache data).")
 
     # 4g. Per-activity HR stream analysis + EF/decoupling/interval HR
     # NOTE: power_curve() is called AFTER this loop so all streams are cached first
@@ -147,6 +174,10 @@ def run(init_mode=False, dry_run=False):
     cp_model_data = None
     phenotype_data = None
     is_recovery_week = False
+    cp_trend_data = []
+    hr_at_vo2max_data = []
+    hr_drift_inference = None
+    indoor_ftp_estimate = None
     try:
         # Determine recovery week from PMC
         is_recovery_week = pmc_current.get("atl", 0) < 0.6 * pmc_current.get("ctl", 1)
@@ -181,8 +212,11 @@ def run(init_mode=False, dry_run=False):
         print(f"Power curve: " + " | ".join(
             f"{s}s={v['best']}w" for s, v in curve_data.items() if v["best"]
         ))
-        db_module.append_power_curve(curve_data, date.today())
-        print("DB: power curve written.")
+        if not dry_run:
+            db_module.append_power_curve(curve_data, date.today())
+            print("DB: power curve written.")
+        else:
+            print("DB: power curve write skipped (dry-run).")
 
         # Extended clean power curve + CP model (additive — does not touch power_curve_weekly)
         try:
@@ -192,9 +226,11 @@ def run(init_mode=False, dry_run=False):
                 fetch_hr_fn=strava_client.fetch_hr_stream, max_hr=max_hr,
             )
             cp_model_data = metrics.fit_cp_model(clean_curve)
-            db_module.append_power_curve_extended(clean_curve, date.today())
+            if not dry_run:
+                db_module.append_power_curve_extended(clean_curve, date.today())
             if cp_model_data:
-                db_module.append_cp_model(cp_model_data, date.today())
+                if not dry_run:
+                    db_module.append_cp_model(cp_model_data, date.today())
                 print(
                     f"CP model: {cp_model_data['model_type']} | "
                     f"CP={cp_model_data['cp_watts']}w | W'={cp_model_data['w_prime_kj']}kJ | "
@@ -212,6 +248,25 @@ def run(init_mode=False, dry_run=False):
         ef_data = db_module.ef_trend(weeks=4)
         interval_hr_data = db_module.interval_hr_trend(weeks=4)
         curve_trend = db_module.power_curve_trend()
+
+        # Inference signals: CP trend + HR at fixed power
+        cp_trend_data = db_module.cp_model_trend(weeks=8)
+        vo2max_target_w = 378  # calibrated outdoor 4-min VO2max target (from preferences)
+        hr_at_vo2max_data = db_module.interval_hr_at_power(
+            vo2max_target_w, tolerance_pct=0.06, weeks=8, peloton_factor=peloton_factor
+        )
+        hr_drift_inference = metrics.hr_drift_cp_inference(hr_at_vo2max_data)
+        indoor_ftp_estimate = metrics.estimate_indoor_ftp(
+            activities, strava_client.fetch_power_stream,
+            peloton_factor=peloton_factor, weeks=8,
+        )
+        if hr_drift_inference:
+            print(f"HR-drift CP inference: {hr_drift_inference['note']} → "
+                  f"implied CP change ~{hr_drift_inference['cp_change_w']:+.0f}w "
+                  f"({hr_drift_inference['confidence']} confidence)")
+        if indoor_ftp_estimate:
+            print(f"Indoor FTP estimate: {indoor_ftp_estimate['ftp_raw_w']}w raw "
+                  f"(= {indoor_ftp_estimate['ftp_true_w']}w outdoor-equiv)")
 
         phenotype_data = metrics.compute_power_phenotype(curve_data)
         print(f"Phenotype: {phenotype_data['primary']} — {phenotype_data['best_kom_label']}")
@@ -272,7 +327,8 @@ def run(init_mode=False, dry_run=False):
             home_lat=home_lat, home_lng=home_lng,
         )
         print(f"Segments tracked: {len(segment_tracker)}")
-        db_module.append_segment_efforts(segment_tracker)
+        if not dry_run:
+            db_module.append_segment_efforts(segment_tracker)
     except Exception as e:
         print(f"Segment tracking failed (non-fatal): {e}")
         segment_tracker = []
@@ -352,6 +408,10 @@ def run(init_mode=False, dry_run=False):
             phenotype_data=phenotype_data, yoy_data=yoy_data,
             fitness_test_triggers=fitness_test_triggers,
             cp_model_data=cp_model_data,
+            cp_trend_data=cp_trend_data,
+            hr_at_vo2max_data=hr_at_vo2max_data,
+            hr_drift_inference=hr_drift_inference,
+            indoor_ftp_estimate=indoor_ftp_estimate,
         )
     else:
         current_plan       = coach._load_plan()
@@ -433,23 +493,30 @@ def run(init_mode=False, dry_run=False):
             phenotype_data=phenotype_data, yoy_data=yoy_data,
             fitness_test_triggers=fitness_test_triggers,
             cp_model_data=cp_model_data,
+            cp_trend_data=cp_trend_data,
+            hr_at_vo2max_data=hr_at_vo2max_data,
+            hr_drift_inference=hr_drift_inference,
+            indoor_ftp_estimate=indoor_ftp_estimate,
         )
 
-    # Log coaching history (non-fatal)
-    try:
-        _log_week_start = date.fromisoformat(last_week["week_start"])
-        db_module.insert_coaching_log(
-            week_start=_log_week_start,
-            plan_before=plan_before_snapshot,
-            plan_after=updated_plan,
-            email_json=email_content,
-            tss_planned=planned_tss,
-            tss_actual=last_week.get("tss", 0),
-            tsb_at_week_start=pmc_current.get("tsb", 0),
-        )
-        print("DB: coaching log written.")
-    except Exception as e:
-        print(f"DB coaching log write failed (non-fatal): {e}")
+    # Log coaching history (non-fatal — skip on dry-run to avoid false log entries)
+    if not dry_run:
+        try:
+            _log_week_start = date.fromisoformat(last_week["week_start"])
+            db_module.insert_coaching_log(
+                week_start=_log_week_start,
+                plan_before=plan_before_snapshot,
+                plan_after=updated_plan,
+                email_json=email_content,
+                tss_planned=planned_tss,
+                tss_actual=last_week.get("tss", 0),
+                tsb_at_week_start=pmc_current.get("tsb", 0),
+            )
+            print("DB: coaching log written.")
+        except Exception as e:
+            print(f"DB coaching log write failed (non-fatal): {e}")
+    else:
+        print("DB: coaching log write skipped (dry-run).")
 
     # 7. Build HTML
     html = email_builder.build_email(
@@ -473,6 +540,7 @@ def run(init_mode=False, dry_run=False):
         curve_trend=curve_trend,
         is_recovery_week=is_recovery_week,
         test_prescription=email_content.get("test_prescription"),
+        pmc_history=pmc_history,
     )
 
     # 8. Send or print
@@ -506,7 +574,7 @@ def run_new_block(dry_run=False):
     strava_client.refresh_access_token()
     activities = strava_client.fetch_activities(weeks=8, force_refresh=not dry_run)
 
-    ftp_outdoor, ftp_indoor = metrics.load_ftps()
+    ftp_outdoor, ftp_indoor, ftp_indoor_working, peloton_factor = metrics.load_ftps()
     zone_ranges  = metrics.compute_zone_ranges(ftp_outdoor, ftp_indoor)
     tss_by_day   = metrics.daily_tss(activities, ftp_outdoor, ftp_indoor, weeks=8)
     pmc_series   = metrics.compute_pmc(tss_by_day)
@@ -546,6 +614,29 @@ def run_new_block(dry_run=False):
         curve_trend = db_module.power_curve_trend()
     except Exception as e:
         print(f"Power curve collection failed (non-fatal): {e}")
+
+    # Inference signals for block generation
+    cp_trend_data    = []
+    hr_at_vo2max_data = []
+    hr_drift_inference = None
+    indoor_ftp_estimate = None
+    ef_data_block = None
+    cp_model_data_block = None
+    try:
+        cp_trend_data    = db_module.cp_model_trend(weeks=8)
+        hr_at_vo2max_data = db_module.interval_hr_at_power(
+            378, tolerance_pct=0.06, weeks=8, peloton_factor=peloton_factor
+        )
+        hr_drift_inference = metrics.hr_drift_cp_inference(hr_at_vo2max_data)
+        indoor_ftp_estimate = metrics.estimate_indoor_ftp(
+            activities, strava_client.fetch_power_stream,
+            peloton_factor=peloton_factor, weeks=8,
+        )
+        ef_data_block = db_module.ef_trend(weeks=4)
+        if cp_trend_data:
+            cp_model_data_block = cp_trend_data[-1]  # most recent week
+    except Exception as e:
+        print(f"Inference signals for new block failed (non-fatal): {e}")
 
     # Segments
     segment_tracker = []
@@ -664,6 +755,12 @@ def run_new_block(dry_run=False):
         debrief=debrief,
         fitness_assessment=fitness_assessment,
         block_history_str=block_history_str,
+        ef_data=ef_data_block,
+        cp_model_data=cp_model_data_block,
+        cp_trend_data=cp_trend_data,
+        hr_at_vo2max_data=hr_at_vo2max_data,
+        hr_drift_inference=hr_drift_inference,
+        indoor_ftp_estimate=indoor_ftp_estimate,
     )
 
     # --- Archive old plan ---

@@ -55,7 +55,7 @@ def main():
         sys.exit(1)
     print(f"Home: {home_lat}, {home_lng}")
 
-    ftp_outdoor, _ = metrics.load_ftps()
+    ftp_outdoor, *_ = metrics.load_ftps()
 
     # Fetch starred segments for profile learning
     print("Fetching starred segments...")

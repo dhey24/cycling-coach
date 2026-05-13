@@ -1166,7 +1166,7 @@ def main():
     # 1. Bootstrap
     strava_client.refresh_access_token()
     activities = strava_client.fetch_activities(weeks=8, force_refresh=False)
-    ftp_outdoor, ftp_indoor = metrics.load_ftps()
+    ftp_outdoor, ftp_indoor, *_ = metrics.load_ftps()
     home_lat, home_lng = metrics.load_home_coords()
 
     print("Computing power curve...")

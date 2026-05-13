@@ -33,12 +33,37 @@ def _card(title, headline, body, accent=TEAL):
     </div>"""
 
 
-def _stat_pill(label, value, color=SLATE):
+def _sparkline(values, width=80, height=22, color=TEAL, stroke=1.5):
+    """Inline SVG sparkline. Returns empty string if fewer than 2 non-None values."""
+    pts = [v for v in values if v is not None]
+    if len(pts) < 2:
+        return ""
+    lo, hi = min(pts), max(pts)
+    rng = hi - lo or 1
+    n = len(pts)
+    coords = " ".join(
+        f"{i * width / (n - 1):.1f},{height - (v - lo) / rng * height:.1f}"
+        for i, v in enumerate(pts)
+    )
+    return (
+        f'<svg width="{width}" height="{height}" '
+        f'style="display:inline-block;vertical-align:middle;overflow:visible;" '
+        f'xmlns="http://www.w3.org/2000/svg">'
+        f'<polyline points="{coords}" fill="none" stroke="{color}" '
+        f'stroke-width="{stroke}" stroke-linecap="round" stroke-linejoin="round"/>'
+        f'</svg>'
+    )
+
+
+def _stat_pill(label, value, color=SLATE, sparkline_html=""):
+    spark = (f'<div style="margin-top:4px;">{sparkline_html}</div>'
+             if sparkline_html else "")
     return f"""
       <div style="display:inline-block;margin:4px 6px;text-align:center;">
         <div style="font-size:20px;font-weight:800;color:{color};">{value}</div>
         <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;
                     letter-spacing:0.06em;">{label}</div>
+        {spark}
       </div>"""
 
 
@@ -275,6 +300,7 @@ def _week_table(this_week_plan, zone_ranges=None, ftp_outdoor=323, ftp_indoor=27
             "z2":         "#22c55e",
             "tempo":      "#84cc16",
             "sweet_spot": "#f97316",
+            "threshold":  "#f59e0b",
             "vo2max":     "#ef4444",
             "anaerobic":  "#8b5cf6",
             "race":       "#0ea5e9",
@@ -1099,6 +1125,37 @@ def _segment_card(segment_data):
     </div>"""
 
 
+def _weekly_review_card(fitness, recap, hr_insight):
+    """Single card merging last_week_recap + fitness_snapshot."""
+    recap_headline = recap.get("headline", "")
+    recap_body     = recap.get("body", "")
+    fitness_body   = fitness.get("body", "")
+
+    fitness_section = ""
+    if fitness_body:
+        fitness_section = f"""
+      <div style="margin-top:14px;padding-top:14px;border-top:1px solid {BORDER};">
+        <p style="margin:0 0 4px;font-size:10px;font-weight:700;color:#94a3b8;
+                  text-transform:uppercase;letter-spacing:0.08em;">Current Fitness</p>
+        <p style="margin:0;font-size:13px;color:#475569;line-height:1.6;">{fitness_body}</p>
+        {hr_insight}
+      </div>"""
+
+    return f"""
+    <div style="background:#ffffff;border-radius:8px;border:1px solid {BORDER};
+                margin-bottom:16px;overflow:hidden;">
+      <div style="background:{SLATE};padding:10px 20px;">
+        <span style="color:rgba(255,255,255,0.75);font-size:11px;font-weight:600;
+                     text-transform:uppercase;letter-spacing:0.08em;">Weekly Review</span>
+      </div>
+      <div style="padding:16px 20px;">
+        <p style="margin:0 0 8px;font-size:16px;font-weight:700;color:{SLATE};">{recap_headline}</p>
+        <p style="margin:0;font-size:14px;color:#475569;line-height:1.6;">{recap_body}</p>
+        {fitness_section}
+      </div>
+    </div>"""
+
+
 def build_email(email_content, pmc_current, last_week_summary,
                 session_comparison=None, hr_data=None,
                 init_mode=False, block_overview=None,
@@ -1109,9 +1166,11 @@ def build_email(email_content, pmc_current, last_week_summary,
                 segment_data=None,
                 ef_data=None, interval_hr_data=None, rpe_signals=None,
                 curve_trend=None, is_recovery_week=False,
-                test_prescription=None):
+                test_prescription=None,
+                pmc_history=None):
     """
     Build full HTML email from Claude's email_content dict + PMC data.
+    pmc_history: optional list of (ctl, tss) weekly tuples, oldest first (13 weeks).
     """
     ctl      = pmc_current.get("ctl", 0)
     atl      = pmc_current.get("atl", 0)
@@ -1122,6 +1181,14 @@ def build_email(email_content, pmc_current, last_week_summary,
     today_str = date.today().strftime("%A, %B %-d, %Y")
     tsb_col   = _tsb_color(tsb)
 
+    # Sparklines from pmc_history (list of {ctl, tss} dicts, oldest first)
+    ctl_spark = tss_spark = ""
+    if pmc_history and len(pmc_history) >= 3:
+        ctl_vals = [h.get("ctl") for h in pmc_history]
+        tss_vals = [h.get("tss") for h in pmc_history]
+        ctl_spark = _sparkline(ctl_vals, color="rgba(255,255,255,0.7)")
+        tss_spark = _sparkline(tss_vals, color="rgba(255,255,255,0.7)")
+
     # Header stats bar
     stats_bar = f"""
     <div style="background:{SLATE};border-radius:8px;padding:16px 20px;
@@ -1129,15 +1196,15 @@ def build_email(email_content, pmc_current, last_week_summary,
       <p style="margin:0 0 12px;color:rgba(255,255,255,0.5);font-size:11px;
                 text-transform:uppercase;letter-spacing:0.1em;">Performance Management</p>
       <div>
-        {_stat_pill("CTL Fitness", f"{ctl:.0f}", TEAL)}
+        {_stat_pill("CTL Fitness", f"{ctl:.0f}", TEAL, ctl_spark)}
         {_stat_pill("ATL Fatigue", f"{atl:.0f}", AMBER)}
         {_stat_pill("TSB Form", f"{tsb:+.0f}", tsb_col)}
-        {_stat_pill("Week TSS", f"{week_tss:.0f}", GREEN)}
+        {_stat_pill("Week TSS", f"{week_tss:.0f}", GREEN, tss_spark)}
         {_stat_pill("Week km", f"{week_km:.0f}", "#94a3b8")}
       </div>
     </div>"""
 
-    # HR insight line for fitness snapshot
+    # HR insight line for weekly review card
     hr_insight = ""
     if hr_data and hr_data.get("power_hr_ratio_last_week"):
         ratio_lw   = hr_data["power_hr_ratio_last_week"]
@@ -1159,21 +1226,6 @@ def build_email(email_content, pmc_current, last_week_summary,
     note     = email_content.get("coaches_note", {})
     plan     = email_content.get("this_week_plan", {})
 
-    fitness_body = fitness.get("body", "")
-    fitness_card = f"""
-    <div style="background:#ffffff;border-radius:8px;border:1px solid {BORDER};
-                margin-bottom:16px;overflow:hidden;">
-      <div style="background:{TEAL};padding:10px 20px;">
-        <span style="color:rgba(255,255,255,0.75);font-size:11px;font-weight:600;
-                     text-transform:uppercase;letter-spacing:0.08em;">Fitness Snapshot</span>
-      </div>
-      <div style="padding:16px 20px;">
-        <p style="margin:0 0 8px;font-size:16px;font-weight:700;color:{SLATE};">{fitness.get("headline", "")}</p>
-        <p style="margin:0;font-size:14px;color:#475569;line-height:1.6;">{fitness_body}</p>
-        {hr_insight}
-      </div>
-    </div>"""
-
     # Data range defaults
     if not data_range_start:
         from datetime import date as d, timedelta
@@ -1186,13 +1238,11 @@ def build_email(email_content, pmc_current, last_week_summary,
         + _rides_data_section(last_week_summary, data_range_start, data_range_end, ftp_outdoor, ftp_indoor,
                               strava_descriptions=strava_descriptions, checkin_data=checkin_data)
         + (_power_curve_card(power_curve_data, ftp_outdoor, curve_trend=curve_trend, is_recovery_week=is_recovery_week) if power_curve_data else "")
-        + (_segment_card(segment_data) if segment_data else "")
         + (_ef_hr_card(ef_data, interval_hr_data, rpe_signals) if (ef_data or interval_hr_data or rpe_signals) else "")
-        + fitness_card
         + ((_block_overview_card(block_overview)) if init_mode and block_overview else "")
-        + _card("Last Week", recap.get("headline", ""), recap.get("body", ""), SLATE)
         + (_session_comparison_table(session_comparison, zone_ranges, ftp_outdoor, ftp_indoor)
            if session_comparison else "")
+        + _weekly_review_card(fitness, recap, hr_insight)
         + (_test_prescription_card(test_prescription) if test_prescription else "")
         + _week_table(plan, zone_ranges=zone_ranges, ftp_outdoor=ftp_outdoor, ftp_indoor=ftp_indoor)
         + _card("Block Progress", progress.get("headline", ""), progress.get("body", ""), GREEN)
@@ -1264,10 +1314,11 @@ def build_transition_email(email_content, pmc_current, ctl_block_start,
                            debrief, fitness_assessment, new_plan,
                            zone_ranges=None, ftp_outdoor=323, ftp_indoor=275,
                            power_curve_data=None, curve_trend=None,
-                           segment_data=None):
+                           segment_data=None, block_sequence=None):
     """
-    Build the block transition HTML email: block scorecard + next block overview.
+    Build the block transition HTML email: block story + scorecard + next block overview.
     Separate from build_email() (the weekly email).
+    block_sequence: (block_number_this_year, total_all_time) tuple — displayed in header.
     """
     today_str = date.today().strftime("%A, %B %-d, %Y")
     ec        = email_content or {}
@@ -1277,11 +1328,21 @@ def build_transition_email(email_content, pmc_current, ctl_block_start,
     tsb     = pmc_current.get("tsb", 0)
     ctl_str = f"{ctl_block_start:.0f}→{ctl:.0f}" if ctl_block_start else f"{ctl:.0f}"
 
-    # Debrief values
+    # Block sequence
+    block_num_year, block_total = block_sequence if block_sequence else (None, None)
+    year = date.today().year
+    block_label = f"Block {block_num_year} · {year}" if block_num_year else "Block Transition"
+
+    # Debrief values (all 8 fields)
     d = debrief or {}
-    goal_label = d.get("goal_achieved_label", "—")
-    motivation = d.get("motivation_label", "—")
-    limiter    = d.get("biggest_limiter") or "None reported"
+    goal_label      = d.get("goal_achieved_label", "—")
+    motivation      = d.get("motivation_label", "—")
+    limiter         = d.get("biggest_limiter") or "None reported"
+    injuries        = d.get("injuries") or "None"
+    disruptions     = d.get("disruptions") or "None"
+    goal_shifted    = ("Yes — " + d.get("goal_description", "")) if d.get("goal_shifted") else "No"
+    avail_changed   = ("Yes — " + d.get("availability_description", "")) if d.get("availability_changed") else "No"
+    test_pref       = d.get("test_preference_label", "—")
 
     # Fitness assessment
     fa       = fitness_assessment or {}
@@ -1357,6 +1418,22 @@ def build_transition_email(email_content, pmc_current, ctl_block_start,
 
     # Main cards
     cards = ""
+    # Block Story — narrative recap of the completed block
+    if ec.get("block_story"):
+        cards += _card(
+            ec["block_story"].get("headline", "Block Recap"),
+            ec["block_story"].get("headline", ""),
+            ec["block_story"].get("body", ""),
+            accent=TEAL,
+        )
+    # Season Arc — where this sits in the training year
+    if ec.get("season_arc"):
+        cards += _card(
+            "Season Arc",
+            ec["season_arc"].get("headline", "Season position"),
+            ec["season_arc"].get("body", ""),
+            accent=PURPLE,
+        )
     cards += _card(
         "Block Scorecard",
         ec.get("block_scorecard", {}).get("headline", "Block complete"),
@@ -1370,7 +1447,12 @@ def build_transition_email(email_content, pmc_current, ctl_block_start,
       <div style="font-size:13px;color:{SLATE};line-height:1.7;">
         <b>Goal achieved:</b> {goal_label}<br>
         <b>Motivation:</b> {motivation}<br>
-        <b>Biggest limiter:</b> {limiter}
+        <b>Biggest limiter:</b> {limiter}<br>
+        <b>Injuries/concerns:</b> {injuries}<br>
+        <b>Disruptions:</b> {disruptions}<br>
+        <b>Goal shifted:</b> {goal_shifted}<br>
+        <b>Availability changed:</b> {avail_changed}<br>
+        <b>Test preference:</b> {test_pref}
       </div>
     </div>"""
     cards += _card(
@@ -1427,10 +1509,10 @@ def build_transition_email(email_content, pmc_current, ctl_block_start,
     <div style="text-align:center;margin-bottom:20px;">
       <p style="margin:0;font-size:13px;color:#94a3b8;">{today_str}</p>
       <h1 style="margin:4px 0 0;font-size:22px;font-weight:800;color:{SLATE};">
-        Block Transition Report
+        {block_label} — Block Transition
       </h1>
       <p style="margin:4px 0 0;font-size:13px;color:#64748b;">
-        Block complete — new 5-week plan generated
+        Block complete — new plan generated
       </p>
     </div>
 

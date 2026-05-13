@@ -11,7 +11,8 @@ from datetime import datetime, timedelta
 
 STRAVA_BASE = "https://www.strava.com/api/v3"
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "data")
-ACTIVITIES_CACHE = os.path.join(CACHE_DIR, "activities.json")
+ACTIVITIES_CACHE     = os.path.join(CACHE_DIR, "activities.json")
+ACTIVITIES_ALL_CACHE = os.path.join(os.path.dirname(__file__), ".cache", "activities_all.json")
 RATE_LIMIT_DELAY = 0.5
 
 
@@ -104,6 +105,50 @@ def fetch_activities(weeks=8, force_refresh=False):
     with open(ACTIVITIES_CACHE, "w") as f:
         json.dump(activities, f)
     print(f"Fetched and cached {len(activities)} activities.")
+    return activities
+
+
+def fetch_all_activities(force_refresh=False):
+    """
+    Fetch ALL rides ever from Strava (no time filter). Cached to
+    .cache/activities_all.json — safe to call repeatedly, won't re-fetch
+    unless force_refresh=True.
+
+    Used by fill_pmc_history.py for the one-time PMC backfill, and by
+    main.py to seed the 8-week PMC computation with a historically accurate
+    starting CTL.
+    """
+    os.makedirs(os.path.dirname(ACTIVITIES_ALL_CACHE), exist_ok=True)
+
+    if not force_refresh and os.path.exists(ACTIVITIES_ALL_CACHE):
+        with open(ACTIVITIES_ALL_CACHE) as f:
+            activities = json.load(f)
+        print(f"Loaded {len(activities)} all-time activities from cache.")
+        return activities
+
+    activities = []
+    page = 1
+    print("Fetching all-time activities from Strava (this may take a moment)...")
+    while True:
+        resp = requests.get(
+            f"{STRAVA_BASE}/athlete/activities",
+            headers=_headers(),
+            params={"per_page": 200, "page": page},
+        )
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        activities.extend(batch)
+        print(f"  ...page {page}: {len(batch)} activities (total {len(activities)})")
+        if len(batch) < 200:
+            break
+        page += 1
+        time.sleep(RATE_LIMIT_DELAY)
+
+    with open(ACTIVITIES_ALL_CACHE, "w") as f:
+        json.dump(activities, f)
+    print(f"Fetched and cached {len(activities)} all-time activities.")
     return activities
 
 

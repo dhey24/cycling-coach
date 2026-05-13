@@ -27,7 +27,7 @@ load_dotenv()
 import strava_client
 import metrics
 
-INTERVAL_TYPES = {"vo2max", "anaerobic", "sweet_spot", "tempo"}
+INTERVAL_TYPES = {"vo2max", "anaerobic", "sweet_spot", "tempo", "threshold"}
 Z2_TYPES = {"z2", "z1"}
 
 # Statuses
@@ -461,7 +461,7 @@ def main():
 
     strava_client.refresh_access_token()
     activities = strava_client.fetch_activities(weeks=max(weeks + 1, 4))
-    ftp_outdoor, ftp_indoor = metrics.load_ftps()
+    ftp_outdoor, ftp_indoor, *_ = metrics.load_ftps()
     plan = load_plan()
 
     if plan is None:

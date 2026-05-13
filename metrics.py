@@ -68,21 +68,64 @@ def load_home_coords(preferences_path="preferences.md"):
 
 
 def load_ftps(preferences_path="preferences.md"):
-    """Parse FTP_OUTDOOR and FTP_INDOOR from preferences.md."""
-    ftp_outdoor = 323  # CP model estimate
-    ftp_indoor  = 275  # Peloton test
+    """
+    Parse FTP_OUTDOOR, FTP_INDOOR, FTP_INDOOR_WORKING, and PELOTON_DEVICE_FACTOR
+    from preferences.md.
+
+    Returns (ftp_outdoor, ftp_indoor, ftp_indoor_working, peloton_factor).
+    ftp_indoor_working is the session-inferred estimate (may be None if not set).
+    peloton_factor is the hardware calibration constant (default 1.18).
+    """
+    ftp_outdoor       = 310   # CP model working estimate
+    ftp_indoor        = 275   # Peloton FTP test (may be stale)
+    ftp_indoor_working = None  # session-inferred working estimate
+    peloton_factor    = 1.18  # hardware device calibration (Peloton reads ~18% low)
+
+    def _key(line):
+        """Strip markdown list prefix (- , * , + ) before key matching."""
+        s = line.strip()
+        if s.startswith(("- ", "* ", "+ ")):
+            s = s[2:]
+        return s
+
+    def _int_val(s, key):
+        """Extract integer after 'KEY:'. Strips trailing 'w' unit if present."""
+        after = s[len(key):].strip().split()[0].rstrip("w")
+        return int(after)
+
+    def _float_val(s, key):
+        """Extract float after 'KEY:'."""
+        after = s[len(key):].strip().split()[0].rstrip("w")
+        return float(after)
 
     try:
         with open(preferences_path) as f:
             for line in f:
-                if line.strip().startswith("FTP_OUTDOOR:"):
-                    ftp_outdoor = int(line.split(":")[1].split()[0])
-                elif line.strip().startswith("FTP_INDOOR:"):
-                    ftp_indoor = int(line.split(":")[1].split()[0])
+                s = _key(line)
+                if s.startswith("FTP_OUTDOOR:"):
+                    try:
+                        ftp_outdoor = _int_val(s, "FTP_OUTDOOR:")
+                    except (ValueError, IndexError):
+                        pass
+                elif s.startswith("FTP_INDOOR_WORKING:"):
+                    try:
+                        ftp_indoor_working = _int_val(s, "FTP_INDOOR_WORKING:")
+                    except (ValueError, IndexError):
+                        pass
+                elif s.startswith("FTP_INDOOR:"):
+                    try:
+                        ftp_indoor = _int_val(s, "FTP_INDOOR:")
+                    except (ValueError, IndexError):
+                        pass
+                elif s.startswith("PELOTON_DEVICE_FACTOR:"):
+                    try:
+                        peloton_factor = _float_val(s, "PELOTON_DEVICE_FACTOR:")
+                    except (ValueError, IndexError):
+                        pass
     except FileNotFoundError:
         pass
 
-    return ftp_outdoor, ftp_indoor
+    return ftp_outdoor, ftp_indoor, ftp_indoor_working, peloton_factor
 
 
 def update_ftp(new_ftp, which="outdoor", preferences_path="preferences.md"):
@@ -170,18 +213,13 @@ def tss_for_ride(ride, ftp_outdoor, ftp_indoor):
 def daily_tss(activities, ftp_outdoor, ftp_indoor, weeks=8):
     """
     Build a dict of {date: total_tss} for the past N weeks.
+    If weeks=None, span from the earliest ride date to today (all-time mode).
     Days with no rides get TSS=0.
     """
     today = date.today()
-    start = today - timedelta(weeks=weeks)
 
-    tss_by_day = {}
-    # Pre-populate all days with 0
-    d = start
-    while d <= today:
-        tss_by_day[d] = 0.0
-        d += timedelta(days=1)
-
+    # Collect ride dates and TSS first so we know the actual span
+    ride_tss_map = {}
     for ride in activities:
         if ride.get("type") != "Ride":
             continue
@@ -193,8 +231,25 @@ def daily_tss(activities, ftp_outdoor, ftp_indoor, weeks=8):
             ride_date = date.fromisoformat(ride_date_str)
         except ValueError:
             continue
+        ride_tss_map[ride_date] = ride_tss_map.get(ride_date, 0.0) + ride_tss
+
+    if weeks is None:
+        # All-time mode: start from earliest ride date
+        start = min(ride_tss_map.keys()) if ride_tss_map else today
+    else:
+        start = today - timedelta(weeks=weeks)
+
+    # Pre-populate all days with 0
+    tss_by_day = {}
+    d = start
+    while d <= today:
+        tss_by_day[d] = 0.0
+        d += timedelta(days=1)
+
+    # Fill in actual TSS (only dates within the window)
+    for ride_date, tss in ride_tss_map.items():
         if ride_date in tss_by_day:
-            tss_by_day[ride_date] = tss_by_day.get(ride_date, 0) + ride_tss
+            tss_by_day[ride_date] += tss
 
     return tss_by_day
 
@@ -203,13 +258,16 @@ def daily_tss(activities, ftp_outdoor, ftp_indoor, weeks=8):
 # PMC: CTL / ATL / TSB
 # ---------------------------------------------------------------------------
 
-def compute_pmc(tss_by_day, ctl_days=42, atl_days=7):
+def compute_pmc(tss_by_day, ctl_days=42, atl_days=7, ctl_seed=0.0, atl_seed=0.0):
     """
     Compute Performance Management Chart metrics.
 
     CTL (fitness):  42-day exponential weighted average of daily TSS
     ATL (fatigue):   7-day exponential weighted average of daily TSS
     TSB (form):     CTL - ATL (positive = fresh, negative = fatigued)
+
+    ctl_seed / atl_seed: starting values (from DB history) so the window
+    doesn't have to recompute from zero each run.
 
     Returns list of dicts sorted by date:
       [{"date": date, "tss": float, "ctl": float, "atl": float, "tsb": float}, ...]
@@ -218,8 +276,8 @@ def compute_pmc(tss_by_day, ctl_days=42, atl_days=7):
     if not sorted_days:
         return []
 
-    ctl = 0.0
-    atl = 0.0
+    ctl = float(ctl_seed)
+    atl = float(atl_seed)
     results = []
 
     for d in sorted_days:
@@ -324,6 +382,79 @@ def weekly_summary(activities, ftp_outdoor, ftp_indoor, week_offset=0):
 _STOP_WORDS = {"the", "a", "an", "and", "or", "in", "at", "for", "with",
                "min", "warmup", "cooldown", "focus"}
 
+# Keywords that signal what type of effort a ride was
+_VO2MAX_WORDS    = {"vo2", "v02"}
+_ANAEROBIC_WORDS = {"anaerobic"}
+_TEMPO_WORDS     = {"tempo", "sweetspot", "sweet", "threshold"}
+_INTERVAL_WORDS  = {"interval", "intervals"}   # generic hard effort
+_EASY_WORDS      = {"z2", "z1", "recovery", "shakeout", "flush", "easy", "endurance", "base"}
+
+
+def _type_compatibility(session_type, ride_name):
+    """
+    Score 0–1 for how well a ride's name signals match the planned session type.
+      1.0 — ride name clearly matches session type
+      0.5 — no signal either way (neutral)
+      0.0 — ride name clearly signals a different incompatible type
+
+    This prevents a Z2 ride done on the exact planned day from outscoring a VO2max
+    ride done one day early just because date proximity dominates.
+    """
+    words = set(re.sub(r"[^a-z0-9]", " ", ride_name.lower()).split())
+
+    has_vo2max    = bool(words & _VO2MAX_WORDS)
+    has_anaerobic = bool(words & _ANAEROBIC_WORDS)
+    has_tempo     = bool(words & _TEMPO_WORDS)
+    has_interval  = bool(words & _INTERVAL_WORDS)
+    has_easy      = bool(words & _EASY_WORDS)
+
+    if session_type in ("vo2max",):
+        if has_easy and not has_interval:
+            return 0.0   # clearly an easy ride vs hard session
+        if has_vo2max or has_interval:
+            return 1.0
+        if has_anaerobic or has_tempo:
+            return 0.3   # different hard type
+        return 0.5
+
+    if session_type in ("anaerobic",):
+        if has_easy and not has_interval:
+            return 0.0
+        if has_anaerobic:
+            return 1.0
+        if has_vo2max or has_interval:
+            return 0.4   # similar hard category
+        return 0.5
+
+    if session_type in ("threshold",):
+        if has_easy and not has_interval:
+            return 0.0
+        if has_tempo:  # "threshold" keyword already in _TEMPO_WORDS
+            return 1.0
+        if has_vo2max or has_interval:
+            return 0.5
+        return 0.5
+
+    if session_type in ("tempo", "sweet_spot"):
+        if has_easy and not has_interval:
+            return 0.0
+        if has_tempo:
+            return 1.0
+        if has_interval:
+            return 0.5
+        return 0.5
+
+    if session_type in ("z2", "z1"):
+        if (has_vo2max or has_anaerobic) and not has_easy:
+            return 0.0   # clearly a hard ride vs easy session
+        if has_interval and not has_easy:
+            return 0.1
+        if has_easy:
+            return 1.0
+        return 0.5
+
+    return 0.5  # unknown session type — neutral
+
 
 def _normalize_watts(watts, is_indoor, ftp_outdoor, ftp_indoor):
     """Scale indoor (Peloton) watts to outdoor-equivalent. Outdoor watts pass through unchanged."""
@@ -340,9 +471,10 @@ def _match_score(target_date, session, ride_date, ride, ftp_outdoor=323, ftp_ind
     Returns 0 if the pair is clearly incompatible, otherwise 0–1.
 
     Weights:
-      55% date proximity   (primary — same day preferred)
-      25% name similarity  (shared keywords between ride name and session description)
-      20% power proximity  (actual watts vs planned target range)
+      40% date proximity      (same day preferred, but type can override a 1-day gap)
+      25% type compatibility  (ride name signals vs session type — prevents Z2 stealing VO2max slot)
+      20% name similarity     (shared keywords between ride name and session description)
+      15% power proximity     (actual watts vs planned target range)
 
     All watts normalized to outdoor-equivalent before comparison.
     """
@@ -380,7 +512,9 @@ def _match_score(target_date, session, ride_date, ride, ftp_outdoor=323, ftp_ind
     else:
         name_score = 0.0
 
-    return 0.55 * date_score + 0.20 * power_score + 0.25 * name_score
+    type_score = _type_compatibility(session.get("type", ""), ride.get("name", ""))
+
+    return 0.40 * date_score + 0.25 * type_score + 0.20 * name_score + 0.15 * power_score
 
 
 def match_sessions_to_rides(plan, activities, ftp_outdoor, ftp_indoor, week_offset=1):
@@ -425,7 +559,7 @@ def match_sessions_to_rides(plan, activities, ftp_outdoor, ftp_indoor, week_offs
                 ws = date.fromisoformat(week["week_start"])
             except (ValueError, KeyError):
                 continue
-            if ws == week_start:
+            if abs((ws - week_start).days) <= 2:
                 for session in week.get("sessions", []):
                     day = session.get("day", "").lower()
                     planned_sessions[day] = session
@@ -436,9 +570,40 @@ def match_sessions_to_rides(plan, activities, ftp_outdoor, ftp_indoor, week_offs
         if sess.get("type") != "rest"
     }
 
-    # Step 3 — score every (planned_day, ride) pair
+    # Step 2b — apply manual overrides from data/match_overrides.json
+    # Overrides pin a specific activity_id to a planned day, bypassing scoring.
+    overrides_path = os.path.join(os.path.dirname(__file__), "data", "match_overrides.json")
+    assignments = {}        # day_name → ride
+    assigned_ride_ids = set()
+    if os.path.exists(overrides_path):
+        try:
+            with open(overrides_path) as f:
+                overrides = json.load(f)
+            week_start_str = week_start.isoformat()
+            for ov in overrides:
+                if ov.get("week_start") != week_start_str:
+                    continue
+                day = ov.get("day", "").lower()
+                if not day:
+                    continue
+                act_id = ov.get("activity_id")
+                if act_id is None:
+                    # Explicit force-miss: block auto-matching for this session
+                    assignments[day] = {"_force_miss": True}
+                else:
+                    for ride_date, ride in week_rides:
+                        if ride.get("id") == act_id:
+                            assignments[day] = ride
+                            assigned_ride_ids.add(act_id)
+                            break
+        except Exception:
+            pass
+
+    # Step 3 — score every (planned_day, ride) pair for days not already pinned
     candidates = []
     for day_name, session in non_rest_sessions.items():
+        if day_name in assignments:
+            continue
         target_date = day_name_to_date[day_name]
         for ride_date, ride in week_rides:
             score = _match_score(target_date, session, ride_date, ride, ftp_outdoor, ftp_indoor)
@@ -447,8 +612,6 @@ def match_sessions_to_rides(plan, activities, ftp_outdoor, ftp_indoor, week_offs
 
     # Step 4 — greedy assignment: highest score first, each day and ride used once
     candidates.sort(key=lambda x: x[0], reverse=True)
-    assignments = {}        # day_name → ride
-    assigned_ride_ids = set()
     for score, day_name, ride_date, ride in candidates:
         if day_name in assignments:
             continue
@@ -490,8 +653,12 @@ def match_sessions_to_rides(plan, activities, ftp_outdoor, ftp_indoor, week_offs
     for day_name in ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]:
         planned     = planned_sessions.get(day_name)
         target_date = day_name_to_date[day_name]
-        actual_ride = assignments.get(day_name) or unplanned_by_day.get(day_name)
-        actual      = _make_actual(actual_ride) if actual_ride else None
+        actual_ride = assignments.get(day_name)
+        if actual_ride and actual_ride.get("_force_miss"):
+            actual_ride = None  # explicitly missed — don't fall through to unplanned
+        elif actual_ride is None:
+            actual_ride = unplanned_by_day.get(day_name)
+        actual = _make_actual(actual_ride) if actual_ride else None
 
         # Determine status
         status = "rest"
@@ -534,7 +701,7 @@ def match_sessions_to_rides(plan, activities, ftp_outdoor, ftp_indoor, week_offs
 _STREAM_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
 _MAX_UNCACHED_FETCHES = 20
 
-_INTERVAL_TYPES = {"vo2max", "anaerobic", "sweet_spot", "tempo"}
+_INTERVAL_TYPES = {"vo2max", "anaerobic", "sweet_spot", "tempo", "threshold"}
 _Z2_TYPES = {"z2", "z1"}
 
 
@@ -1418,12 +1585,15 @@ def fit_cp_model(clean_curve):
 # HR analysis for fatigue / fitness trends
 # ---------------------------------------------------------------------------
 
-def hr_analysis(activities, weeks=4, ftp_outdoor=323, ftp_indoor=275):
+def hr_analysis(activities, weeks=4, ftp_outdoor=310, ftp_indoor=275,
+                peloton_factor=1.18):
     """
     Analyze HR patterns from summary data (no streams needed).
 
     Returns dict with power:HR ratio trend, HR elevation flag, and suffer scores.
-    Indoor watts are normalized to outdoor-equivalent before computing ratios.
+    Indoor watts are normalized to outdoor-equivalent using the hardware device factor
+    (peloton_factor), NOT the FTP ratio. This separates hardware calibration from
+    fitness-derived ratios so the normalization remains stable as fitness changes.
     """
     today = date.today()
     cutoff_4wk = today - timedelta(weeks=weeks)
@@ -1459,7 +1629,7 @@ def hr_analysis(activities, weeks=4, ftp_outdoor=323, ftp_indoor=275):
         w  = ride.get("average_watts") or 0
         hr = ride.get("average_heartrate") or 0
         if ride.get("trainer"):
-            w = w * (ftp_outdoor / ftp_indoor)  # normalize to outdoor-equivalent
+            w = w * peloton_factor  # hardware calibration: Peloton reads ~18% low
         return round(w / hr, 3) if hr > 0 else None
 
     ratios_4wk = [r for r in (phr(ride) for ride in rides_4wk) if r]
@@ -1493,6 +1663,113 @@ def hr_analysis(activities, weeks=4, ftp_outdoor=323, ftp_indoor=275):
         "avg_hr_last_week":          round(avg_hr_1wk, 1) if rides_1wk else None,
         "avg_suffer_score_4wk":      round(sum(suffer_4wk) / len(suffer_4wk), 1) if suffer_4wk else None,
         "suffer_score_last_week":    round(sum(suffer_1wk) / len(suffer_1wk), 1) if suffer_1wk else None,
+    }
+
+
+def hr_drift_cp_inference(hr_at_power_by_week):
+    """
+    Estimate implied CP change from HR drift at fixed outdoor-equivalent power.
+
+    Rule of thumb: ~1 BPM drop at near-threshold power ≈ ~1.5w CP gain.
+    This is a rough heuristic calibrated against David's Apr 2026 data:
+      HR at 378w: ~185→172 BPM over 3 weeks → implies +19w; CP model moved +17w ✓
+
+    Returns dict or None if fewer than 2 weekly data points.
+    """
+    if not hr_at_power_by_week or len(hr_at_power_by_week) < 2:
+        return None
+
+    hrs = [r["avg_peak_hr"] for r in hr_at_power_by_week if r.get("avg_peak_hr")]
+    if len(hrs) < 2:
+        return None
+
+    hr_drop = hrs[0] - hrs[-1]       # positive = HR fell over time = aerobic adaptation
+    cp_change_w = round(hr_drop * 1.5, 0)
+
+    try:
+        from datetime import date as _date
+        d0 = _date.fromisoformat(hr_at_power_by_week[0]["week_end"])
+        d1 = _date.fromisoformat(hr_at_power_by_week[-1]["week_end"])
+        span_days = (d1 - d0).days
+    except Exception:
+        span_days = None
+
+    count = sum(r.get("interval_count", 0) for r in hr_at_power_by_week)
+    n_weeks = len(hr_at_power_by_week)
+    confidence = ("high"   if count >= 6 and n_weeks >= 3
+                  else "medium" if count >= 3
+                  else "low")
+
+    avg_w = hr_at_power_by_week[0].get("avg_watts") or "?"
+    return {
+        "cp_change_w":        cp_change_w,
+        "hr_drop_bpm":        round(hr_drop, 1),
+        "confidence":         confidence,
+        "sessions_span_days": span_days,
+        "interval_count":     count,
+        "note": (
+            f"HR at {avg_w}w: {hrs[0]:.0f}→{hrs[-1]:.0f} BPM "
+            f"over {n_weeks} weeks ({count} intervals)"
+        ),
+    }
+
+
+def estimate_indoor_ftp(activities, fetch_stream_fn, peloton_factor=1.18, weeks=8):
+    """
+    Estimate current indoor FTP from best 4-min rolling power on Peloton rides.
+
+    Method: best 4-min raw Peloton watts ÷ 1.15 (≈115% FTP for VO2max intervals)
+    = estimated raw FTP. Multiply by peloton_factor for outdoor-equivalent.
+
+    Returns dict or None if no indoor activity streams found.
+    """
+    from datetime import date as _date, timedelta
+    cutoff = _date.today() - timedelta(weeks=weeks)
+    best_4min_raw = None
+
+    for a in activities:
+        if not a.get("trainer", False):
+            continue
+        if a.get("type") != "Ride":
+            continue
+        rd_str = (a.get("start_date_local") or "")[:10]
+        try:
+            if _date.fromisoformat(rd_str) < cutoff:
+                continue
+        except ValueError:
+            continue
+        if (a.get("moving_time") or 0) < 300:
+            continue
+        try:
+            stream = fetch_stream_fn(a["id"])
+            if not isinstance(stream, list) or len(stream) < 240:
+                continue
+            arr = np.array(stream, dtype=float)
+            arr = np.where(arr < 0, 0, arr)
+            kernel = np.ones(240) / 240
+            rolling = np.convolve(arr, kernel, mode="valid")
+            peak = float(np.max(rolling))
+            if best_4min_raw is None or peak > best_4min_raw:
+                best_4min_raw = peak
+        except Exception:
+            continue
+
+    if best_4min_raw is None or best_4min_raw < 100:
+        return None
+
+    ftp_raw   = round(best_4min_raw / 1.15)
+    ftp_true  = round(ftp_raw * peloton_factor)
+    return {
+        "ftp_raw_w":        ftp_raw,
+        "ftp_true_w":       ftp_true,
+        "source_duration_s":  240,
+        "source_watts_raw":   round(best_4min_raw),
+        "confidence":         "medium",
+        "note": (
+            f"Best 4-min indoor: {round(best_4min_raw)}w raw "
+            f"÷ 1.15 = {ftp_raw}w raw FTP "
+            f"(= {ftp_true}w outdoor-equiv via {peloton_factor}× device factor)"
+        ),
     }
 
 

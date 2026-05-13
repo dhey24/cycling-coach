@@ -377,7 +377,7 @@ def main():
         force_refresh=not args.no_refresh,
     )
 
-    ftp_outdoor, ftp_indoor = metrics.load_ftps()
+    ftp_outdoor, ftp_indoor, *_ = metrics.load_ftps()
     max_hr  = metrics.load_max_hr() or 185
     plan    = json.load(open(os.path.join(os.path.dirname(__file__), "data", "plan.json")))
 

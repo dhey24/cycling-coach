@@ -221,7 +221,33 @@ def get_conn():
             conn.execute(stmt)
         except Exception:
             pass
+    # Migrate session_compliance: add activity_id for traceability
+    try:
+        conn.execute("ALTER TABLE session_compliance ADD COLUMN activity_id BIGINT")
+    except Exception:
+        pass
     return conn
+
+
+def get_pmc_seed(before_date):
+    """
+    Return the most recent CTL and ATL from pmc_daily strictly before before_date.
+    Used to seed compute_pmc() so it continues from real history rather than zero.
+    Returns {"ctl": float, "atl": float} — both 0.0 if no prior rows exist.
+    """
+    conn = get_conn()
+    try:
+        row = conn.execute("""
+            SELECT ctl, atl FROM pmc_daily
+            WHERE date < ? AND ctl > 0
+            ORDER BY date DESC LIMIT 1
+        """, [before_date]).fetchone()
+    except Exception:
+        row = None
+    conn.close()
+    if row:
+        return {"ctl": float(row[0]), "atl": float(row[1])}
+    return {"ctl": 0.0, "atl": 0.0}
 
 
 def append_pmc_rows(pmc_series):
@@ -255,8 +281,9 @@ def append_session_compliance(session_comparison, week_start):
             INSERT INTO session_compliance
             (week_start, day, session_type, planned_duration_min, planned_tss,
              actual_duration_min, actual_tss, actual_avg_watts,
-             efforts_detected, interval_avg_watts, interval_target_watts, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             efforts_detected, interval_avg_watts, interval_target_watts, status,
+             activity_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (week_start, day) DO UPDATE SET
                 session_type = EXCLUDED.session_type,
                 planned_duration_min = EXCLUDED.planned_duration_min,
@@ -267,7 +294,8 @@ def append_session_compliance(session_comparison, week_start):
                 efforts_detected = EXCLUDED.efforts_detected,
                 interval_avg_watts = EXCLUDED.interval_avg_watts,
                 interval_target_watts = EXCLUDED.interval_target_watts,
-                status = EXCLUDED.status
+                status = EXCLUDED.status,
+                activity_id = EXCLUDED.activity_id
         """, [
             week_start,
             day.get("day"),
@@ -281,6 +309,7 @@ def append_session_compliance(session_comparison, week_start):
             istats.get("avg_interval_watts"),
             istats.get("target_watts"),
             day.get("status"),
+            (a or {}).get("id"),
         ])
     conn.close()
 
@@ -404,6 +433,84 @@ def append_cp_model(model_result, week_end):
         model_result.get("avg_anchor_likelihood"),
     ])
     conn.close()
+
+
+def cp_model_trend(weeks=8):
+    """
+    Return week-by-week CP and W' estimates for trend analysis.
+    Returns list of dicts [{week_end, cp_watts, w_prime_kj, confidence, r_squared}], oldest first.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute("""
+            SELECT week_end, cp_watts, w_prime_kj, confidence, r_squared
+            FROM cp_model_weekly
+            WHERE week_end >= current_date - (? * 7)
+              AND cp_watts IS NOT NULL
+            ORDER BY week_end ASC
+        """, [weeks]).fetchall()
+    except Exception:
+        conn.close()
+        return []
+    conn.close()
+    return [
+        {"week_end": str(r[0]), "cp_watts": r[1], "w_prime_kj": r[2],
+         "confidence": r[3], "r_squared": r[4]}
+        for r in rows
+    ]
+
+
+def interval_hr_at_power(target_watts_outdoor, tolerance_pct=0.06, weeks=8,
+                          peloton_factor=1.18):
+    """
+    HR trend at fixed outdoor-equivalent power, pooling indoor + outdoor sessions.
+    Indoor intervals are normalized by peloton_factor before comparing to target range.
+    Returns list of dicts [{week_end, avg_peak_hr, interval_count, avg_watts, indoor_count}].
+    """
+    conn = get_conn()
+    lo = target_watts_outdoor * (1 - tolerance_pct)
+    hi = target_watts_outdoor * (1 + tolerance_pct)
+    try:
+        rows = conn.execute("""
+            SELECT
+                date_trunc('week', i.activity_date) + INTERVAL '6 days' AS week_end,
+                ROUND(AVG(i.peak_hr), 1)  AS avg_peak_hr,
+                COUNT(*)                  AS interval_count,
+                ROUND(AVG(
+                    CASE WHEN am.activity_type = 'indoor'
+                         THEN i.avg_watts * ?
+                         ELSE i.avg_watts END
+                ), 0) AS avg_watts_outdoor_equiv,
+                COUNT(CASE WHEN am.activity_type = 'indoor' THEN 1 END) AS indoor_count
+            FROM interval_hr_stats i
+            LEFT JOIN activity_metrics am ON i.activity_id = am.activity_id
+            WHERE (
+                  (am.activity_type = 'indoor'
+                   AND i.avg_watts * ? BETWEEN ? AND ?)
+                OR
+                  (COALESCE(am.activity_type, 'outdoor') != 'indoor'
+                   AND i.avg_watts BETWEEN ? AND ?)
+            )
+              AND i.activity_date >= current_date - (? * 7)
+              AND i.peak_hr IS NOT NULL
+              AND i.peak_hr > 100
+            GROUP BY 1
+            ORDER BY 1 ASC
+        """, [
+            peloton_factor,
+            peloton_factor, lo, hi,
+            lo, hi,
+            weeks,
+        ]).fetchall()
+    except Exception:
+        conn.close()
+        return []
+    conn.close()
+    return [
+        {"week_end": str(r[0]), "avg_peak_hr": r[1], "interval_count": r[2],
+         "avg_watts": r[3], "indoor_count": r[4]}
+        for r in rows
+    ]
 
 
 def get_cp_model_current():
@@ -732,6 +839,29 @@ def power_curve_trend():
                                 (600, s600_r, s600_p), (1200, s1200_r, s1200_p)]:
         delta = (recent - prior) if (recent and prior) else None
         result[dur] = {"recent": recent, "prior": prior, "delta": delta}
+
+    # Add 3-min (180s) and 8-min (480s) from extended table (key VO2max training durations)
+    try:
+        conn2 = get_conn()
+        ext_row = conn2.execute("""
+            SELECT
+                MAX(CASE WHEN week_end >= current_date - 28 THEN s180 END)  AS s180_r,
+                MAX(CASE WHEN week_end BETWEEN current_date - 56
+                              AND current_date - 29 THEN s180 END)          AS s180_p,
+                MAX(CASE WHEN week_end >= current_date - 28 THEN s480 END)  AS s480_r,
+                MAX(CASE WHEN week_end BETWEEN current_date - 56
+                              AND current_date - 29 THEN s480 END)          AS s480_p
+            FROM power_curve_extended
+        """).fetchone()
+        conn2.close()
+        if ext_row:
+            s180_r, s180_p, s480_r, s480_p = ext_row
+            for dur, recent, prior in [(180, s180_r, s180_p), (480, s480_r, s480_p)]:
+                delta = (recent - prior) if (recent and prior) else None
+                result[dur] = {"recent": recent, "prior": prior, "delta": delta}
+    except Exception:
+        pass
+
     return result
 
 
@@ -1235,3 +1365,29 @@ def block_history(n=10):
             "p1200s_start", "p1200s_end",
             "goal_achieved", "biggest_limiter", "motivation"]
     return [dict(zip(cols, row)) for row in rows]
+
+
+def get_block_sequence():
+    """Return (block_number_this_year, total_blocks_all_time) from the blocks table.
+
+    block_number_this_year: count of blocks (including active) starting in the current
+    calendar year, ordered by start_date — the active block is block N.
+    total_all_time: total rows in blocks (including active).
+    Returns (1, 1) if no blocks exist yet.
+    """
+    conn = get_conn()
+    try:
+        year = date.today().year
+        row = conn.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE YEAR(start_date) = ?) AS this_year,
+                COUNT(*) AS total
+            FROM blocks
+        """, [year]).fetchone()
+    except Exception:
+        conn.close()
+        return (1, 1)
+    conn.close()
+    if not row or row[1] == 0:
+        return (1, 1)
+    return (int(row[0]), int(row[1]))
